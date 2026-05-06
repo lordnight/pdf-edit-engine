@@ -20,22 +20,43 @@ import pytest
 from pdf_edit_engine.locator import find
 
 if TYPE_CHECKING:
+    from fontTools import ttLib
+
     from pdf_edit_engine.models import TextMatch
 
 
 def _find_ttf_for_cidfont() -> Path | None:
-    """Find a TrueType font for inline Identity-H PDF construction."""
+    """Find a TrueType font for inline Identity-H PDF construction.
+
+    Prefers plain .ttf files over .ttc collections since .ttf avoids
+    needing fontNumber indexing and subset tooling handles them better.
+    """
     candidates = [
         Path("C:/Windows/Fonts/arial.ttf"),
         Path("C:/Windows/Fonts/ARIAL.TTF"),
         Path("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"),
         Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+        Path("/System/Library/Fonts/Supplemental/Arial.ttf"),
+        Path("/System/Library/Fonts/Supplemental/Arial Bold.ttf"),
+        Path("/System/Library/Fonts/Supplemental/Times New Roman.ttf"),
+        Path("/Library/Fonts/Arial Unicode.ttf"),
+        Path("/System/Library/Fonts/Geneva.ttf"),
         Path("/System/Library/Fonts/Helvetica.ttc"),
     ]
     for p in candidates:
         if p.exists():
             return p
     return None
+
+
+def _ttfont_open(path: Path) -> "ttLib.TTFont":
+    """Open a TTFont, handling .ttc collections by selecting font index 0."""
+    from fontTools import ttLib
+
+    kwargs: dict[str, int] = {}
+    if path.suffix.lower() == ".ttc":
+        kwargs["fontNumber"] = 0
+    return ttLib.TTFont(str(path), **kwargs)
 
 
 _no_ttf = pytest.mark.skipif(
@@ -87,7 +108,7 @@ def _build_identity_h_pdf(
     from fontTools import ttLib
     from fontTools.subset import Subsetter
 
-    full = ttLib.TTFont(str(ttf_path))
+    full = _ttfont_open(ttf_path)
     cmap_table = full["cmap"]
     cp_map: dict[int, str] = {}
     for table in cmap_table.tables:
@@ -110,7 +131,7 @@ def _build_identity_h_pdf(
             cp_to_gid[cp] = gid
             used_gids.add(gid)
 
-    sub_font = ttLib.TTFont(str(ttf_path))
+    sub_font = _ttfont_open(ttf_path)
     subsetter = Subsetter()
     subsetter.populate(
         glyphs=[glyph_order[gid] for gid in sorted(used_gids) if gid < len(glyph_order)]

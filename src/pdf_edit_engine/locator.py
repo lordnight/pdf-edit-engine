@@ -17,6 +17,7 @@ from pdf_edit_engine.fragments import TJReconstructor
 from pdf_edit_engine.models import (
     ContentElement,
     FontInfo,
+    GraphicsStateSnapshot,
     TextBlock,
     TextCharacter,
     TextMatch,
@@ -204,9 +205,10 @@ class ContentStreamInterpreter:
             return
         if not decoded:
             return
+        pre_gs = self._tracker.snapshot()
         chars = self._make_text_chars(decoded, raw, idx, tj_fragment_index=None)
         if chars:
-            self._emit_text_element(idx, idx, chars, decoded)
+            self._emit_text_element(idx, idx, chars, decoded, pre_gs=pre_gs)
 
     def _handle_tj_array(
         self,
@@ -221,6 +223,7 @@ class ContentStreamInterpreter:
         if not reconstructed.full_text:
             return
 
+        pre_gs = self._tracker.snapshot()
         chars: list[TextCharacter] = []
         font_name = self._tracker.font_name or ""
         font_size = self._tracker.font_size
@@ -263,7 +266,7 @@ class ContentStreamInterpreter:
                 frag_idx += 1
 
         if chars:
-            self._emit_text_element(idx, idx, chars, reconstructed.full_text)
+            self._emit_text_element(idx, idx, chars, reconstructed.full_text, pre_gs=pre_gs)
 
     def _handle_quote(
         self,
@@ -392,8 +395,18 @@ class ContentStreamInterpreter:
         end_idx: int,
         chars: list[TextCharacter],
         text_content: str,
+        *,
+        pre_gs: GraphicsStateSnapshot | None = None,
     ) -> None:
-        """Create and append a text ContentElement."""
+        """Create and append a text ContentElement.
+
+        Args:
+            pre_gs: Graphics state snapshot taken BEFORE glyph rendering.
+                    When provided, this is stored on the ContentElement instead
+                    of the post-rendering snapshot — critical for preserving the
+                    text matrix's initial (e, f) position rather than the cursor
+                    position after all glyph advances.
+        """
         font_size = chars[0].font_size if chars else 1.0
         x0 = min(c.page_x for c in chars)
         y0 = min(c.page_y for c in chars) - font_size * 0.25
@@ -405,7 +418,7 @@ class ContentStreamInterpreter:
                 page=self._page_number,
                 operator_range=(start_idx, end_idx + 1),
                 bbox=(x0, y0, x1, y1),
-                graphics_state=self._tracker.snapshot(),
+                graphics_state=pre_gs if pre_gs is not None else self._tracker.snapshot(),
                 text_content=text_content,
                 characters=chars,
             )

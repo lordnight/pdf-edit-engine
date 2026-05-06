@@ -423,6 +423,7 @@ from tests._identity_h_fixture import (  # noqa: E402
     _find_ttf_for_cidfont,
     _no_ttf,
     _title_match,
+    _ttfont_open,
 )
 
 
@@ -478,7 +479,7 @@ class TestTier1_5GlyphInjection:
         ttf = _find_ttf_for_cidfont()
         if ttf is None:
             pytest.skip("no TTF font available")
-        font = TTFont(str(ttf))
+        font = _ttfont_open(ttf)
         try:
             glyph = font["glyf"]["A"]
             _strip_glyph_hinting(glyph)
@@ -498,7 +499,7 @@ class TestTier1_5GlyphInjection:
         ttf = _find_ttf_for_cidfont()
         if ttf is None:
             pytest.skip("no TTF font available")
-        font = TTFont(str(ttf))
+        font = _ttfont_open(ttf)
         try:
             glyph = font["glyf"]["A"]  # 'A' is simple in Arial/Liberation/DejaVu
             names = _collect_component_names(glyph, font)
@@ -515,7 +516,7 @@ class TestTier1_5GlyphInjection:
         ttf = _find_ttf_for_cidfont()
         if ttf is None:
             pytest.skip("no TTF font available")
-        font = TTFont(str(ttf))
+        font = _ttfont_open(ttf)
         try:
             # Try common composite glyph names
             candidates = [
@@ -565,7 +566,7 @@ class TestTier1_5GlyphInjection:
             ]
             embedded_bytes = bytes(fd["/FontFile2"].read_bytes())
             embedded = TTFont(io.BytesIO(embedded_bytes))
-            system = TTFont(str(ttf))
+            system = _ttfont_open(ttf)
             try:
                 assert 0x5A not in (embedded.getBestCmap() or {})
 
@@ -605,7 +606,7 @@ class TestTier1_5GlyphInjection:
                 "/FontDescriptor"
             ]
             embedded = TTFont(io.BytesIO(bytes(fd["/FontFile2"].read_bytes())))
-            system = TTFont(str(ttf))
+            system = _ttfont_open(ttf)
             try:
                 system["head"].unitsPerEm = embedded["head"].unitsPerEm + 1
                 with pytest.raises(FontNotFoundError, match="unitsPerEm"):
@@ -632,7 +633,7 @@ class TestTier1_5GlyphInjection:
                 "/FontDescriptor"
             ]
             embedded = TTFont(io.BytesIO(bytes(fd["/FontFile2"].read_bytes())))
-            system = TTFont(str(ttf))
+            system = _ttfont_open(ttf)
             try:
                 if 0xE000 in (system.getBestCmap() or {}):
                     pytest.skip("system font has U+E000 — pick another sentinel")

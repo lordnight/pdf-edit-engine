@@ -806,7 +806,10 @@ def _extend_tier2(
     # Load the embedded font (so we can extend it in place)
     embedded_bytes = bytes(fd["/FontFile2"].read_bytes())
     embedded = TTFont(io.BytesIO(embedded_bytes))
-    system = TTFont(system_path)
+    ttc_kwargs: dict[str, int] = {}
+    if system_path.lower().endswith(".ttc"):
+        ttc_kwargs["fontNumber"] = 0
+    system = TTFont(system_path, **ttc_kwargs)
     try:
         units_per_em = embedded["head"].unitsPerEm
         new_cmap_entries: dict[int, str] = {}

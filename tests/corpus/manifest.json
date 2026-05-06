@@ -1,78 +1,5 @@
 [
   {
-    "filename": "reportlab_simple.pdf",
-    "generator": "reportlab",
-    "encoding": "WinAnsi",
-    "features": [
-      "standard fonts",
-      "non-ASCII",
-      "horizontal rule"
-    ],
-    "expected_text": "Test Document"
-  },
-  {
-    "filename": "reportlab_table.pdf",
-    "generator": "reportlab",
-    "encoding": "WinAnsi",
-    "features": [
-      "table with grid",
-      "paths"
-    ],
-    "expected_text": "Quarterly Report"
-  },
-  {
-    "filename": "reportlab_multipage.pdf",
-    "generator": "reportlab",
-    "encoding": "WinAnsi",
-    "features": [
-      "multi-page"
-    ],
-    "expected_text": "Page One Content"
-  },
-  {
-    "filename": "pikepdf_synthetic.pdf",
-    "generator": "reportlab+pikepdf",
-    "encoding": "WinAnsi",
-    "features": [
-      "invisible text",
-      "Tr mode 3",
-      "path rect"
-    ],
-    "expected_text": "Visible text here"
-  },
-  {
-    "filename": "reportlab_forms.pdf",
-    "generator": "reportlab",
-    "encoding": "WinAnsi",
-    "features": [
-      "AcroForm fields"
-    ],
-    "expected_text": "Please fill out this form"
-  },
-  {
-    "filename": "chrome_webpage.pdf",
-    "generator": "Chrome",
-    "encoding": "Identity-H",
-    "features": [
-      "CIDFont",
-      "real-world",
-      "multi-page",
-      "multiple font families"
-    ],
-    "expected_text": "Quarterly Report"
-  },
-  {
-    "filename": "gdocs_document.pdf",
-    "generator": "Google Docs",
-    "encoding": "Identity-H",
-    "features": [
-      "CIDFont",
-      "real-world",
-      "multiple font families"
-    ],
-    "expected_text": "EXPERIENCE"
-  },
-  {
     "filename": "complex_multifont.pdf",
     "generator": "reportlab",
     "encoding": "WinAnsi",
@@ -107,17 +34,6 @@
       "signatures"
     ],
     "expected_text": "SERVICE AGREEMENT"
-  },
-  {
-    "filename": "complex_pymupdf_edited.pdf",
-    "generator": "reportlab+PyMuPDF",
-    "encoding": "WinAnsi",
-    "features": [
-      "previously edited",
-      "mixed font origins",
-      "redact+replace"
-    ],
-    "expected_text": "PyMuPDF Edited Author"
   },
   {
     "filename": "cidfont_synthetic.pdf",

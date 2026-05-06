@@ -242,7 +242,12 @@ def _build_paragraph(
     if paragraph_width < 1.0:
         paragraph_width = 1.0
 
-    # Line height: average y-gap between consecutive lines
+    # Line height: average y-gap between consecutive lines.
+    # For multi-line: page_y differences give the correct step for Tm f-values
+    # (CTMs with |d|=1 preserve distance magnitudes between page-space and
+    # text-space — which covers all real-world Y-flip PDFs).
+    # For single-line: use page-space font size × 1.2 as default line spacing.
+    # The page-space font size = Tf_size × |tm_a| (accounts for Tm scaling).
     if len(lines) > 1:
         y_positions = [
             line[0].characters[0].page_y  # type: ignore[index]
@@ -294,6 +299,31 @@ def _build_paragraph(
 
     first_line_y = chars0[0].page_y
 
+    # Capture the text matrix (a,b,c,d) from the first element so reflow
+    # can preserve the original orientation when rewriting operators.
+    # PDFs with non-identity CTM (e.g. Y-flip: cm [1 0 0 -1 0 h]) rely on
+    # text matrices having matching counter-rotation; hardcoding identity
+    # produces visibly flipped text.
+    tm = elements[0].graphics_state.text_matrix
+    text_matrix_abcd: tuple[float, float, float, float] | None = None
+    text_matrix_ef: tuple[float, float] | None = None
+    if tm is not None:
+        a, b, c, d = tm[0], tm[1], tm[2], tm[3]
+        is_identity = (
+            abs(a - 1.0) < 1e-6
+            and abs(b) < 1e-6
+            and abs(c) < 1e-6
+            and abs(d - 1.0) < 1e-6
+        )
+        if not is_identity:
+            text_matrix_abcd = (a, b, c, d)
+            text_matrix_ef = (tm[4], tm[5])
+            # For single-line paragraphs, line_height was defaulted from
+            # font_size (Tf value). When Tm carries the visual scale
+            # (font-size-in-Tm pattern), scale line_height to match.
+            if len(lines) == 1 and abs(a) > 1.0 + 1e-6:
+                line_height = line_height * abs(a)
+
     return Paragraph(
         elements=elements,
         full_text=full_text,
@@ -306,6 +336,8 @@ def _build_paragraph(
         first_line_y=first_line_y,
         line_count=len(lines),
         operator_indices=op_indices,
+        text_matrix_abcd=text_matrix_abcd,
+        text_matrix_ef=text_matrix_ef,
     )
 
 
@@ -644,6 +676,8 @@ def _build_replacement_ops(
     *,
     style_palette: Any | None = None,
     extra_resolvers: dict[str, FontResolver] | None = None,
+    text_matrix_abcd: tuple[float, float, float, float] | None = None,
+    text_matrix_ef: tuple[float, float] | None = None,
 ) -> list[tuple[list[Any], Any]]:
     """Build replacement content stream operators for a reflowed paragraph.
 
@@ -723,9 +757,16 @@ def _build_replacement_ops(
     )
 
     # ── Positioning ───────────────────────────────────────────────
-    if resolver.is_cid_font:
+    tm_a, tm_b, tm_c, tm_d = text_matrix_abcd if text_matrix_abcd else (1, 0, 0, 1)
+    use_tm = resolver.is_cid_font or text_matrix_abcd is not None
+    # When text_matrix_ef is provided, use raw text-space coordinates for
+    # Tm positioning. The page-space left_margin/first_line_y would be
+    # double-transformed when multiplied by the active CTM.
+    tm_e = text_matrix_ef[0] if text_matrix_ef else left_margin
+    tm_f = text_matrix_ef[1] if text_matrix_ef else first_line_y
+    if use_tm:
         new_ops.append(
-            ([1, 0, 0, 1, left_margin, first_line_y], pikepdf.Operator("Tm")),
+            ([tm_a, tm_b, tm_c, tm_d, tm_e, tm_f], pikepdf.Operator("Tm")),
         )
     else:
         new_ops.append(
@@ -761,14 +802,26 @@ def _build_replacement_ops(
     # found and continues until the next marker or a non-indented segment.
     in_bullet_section = False
 
+    # For absolute Tm positioning of bullet/marker lines: when the text
+    # matrix has negative d (Y-flip), lines advance by ADDING line_height
+    # to y instead of subtracting.  Use tm_f as the y-origin for
+    # consistency with the first-line Tm.
+    y_step_sign = -1.0 if tm_d >= 0 else 1.0
+
     # Extract indent positions from palette (constant across lines)
     pal_marker_x = getattr(style_palette, "marker_x", 0) if style_palette else 0
     pal_body_x = getattr(style_palette, "body_after_marker_x", 0) if style_palette else 0
 
     for line_idx, line in enumerate(lines[1:], start=1):
-        new_ops.append(
-            ([0.0, -line_height], pikepdf.Operator("Td")),
-        )
+        current_y = tm_f + y_step_sign * line_idx * line_height
+        if use_tm:
+            new_ops.append(
+                ([tm_a, tm_b, tm_c, tm_d, tm_e, current_y], pikepdf.Operator("Tm")),
+            )
+        else:
+            new_ops.append(
+                ([0.0, -line_height], pikepdf.Operator("Td")),
+            )
 
         stripped = line.lstrip()
         marker_char = stripped[:1] if stripped else ""
@@ -778,12 +831,9 @@ def _build_replacement_ops(
         if marker_font and marker_resolver and marker_resolver.can_encode(marker_char)[0]:
             # ── Indented marker line ──────────────────────────────
             in_bullet_section = True
-            # Position marker at marker_x, body text at body_after_marker_x
             if pal_marker_x > 0:
-                # Use absolute Tm for marker position
-                current_y = first_line_y - line_idx * line_height
                 new_ops.append(
-                    ([1, 0, 0, 1, pal_marker_x, current_y], pikepdf.Operator("Tm")),
+                    ([tm_a, tm_b, tm_c, tm_d, pal_marker_x, current_y], pikepdf.Operator("Tm")),
                 )
             if current_font != marker_font:
                 new_ops.append(
@@ -795,15 +845,13 @@ def _build_replacement_ops(
                     resolver=marker_resolver,
                 ),
             )
-            # Position body text after marker
             if marker_font != font_name:
                 new_ops.append(
                     ([body_font_ref, font_size], pikepdf.Operator("Tf")),
                 )
             if pal_body_x > 0:
-                current_y = first_line_y - line_idx * line_height
                 new_ops.append(
-                    ([1, 0, 0, 1, pal_body_x, current_y], pikepdf.Operator("Tm")),
+                    ([tm_a, tm_b, tm_c, tm_d, pal_body_x, current_y], pikepdf.Operator("Tm")),
                 )
             rest = stripped[1:]
             if rest:
@@ -817,16 +865,14 @@ def _build_replacement_ops(
             current_resolver = resolver
         elif in_bullet_section and pal_body_x > 0:
             # ── Continuation of a bullet line ─────────────────────
-            # Indent at body_after_marker_x to create hanging indent.
             if current_font != font_name:
                 new_ops.append(
                     ([body_font_ref, font_size], pikepdf.Operator("Tf")),
                 )
                 current_font = font_name
                 current_resolver = resolver
-            current_y = first_line_y - line_idx * line_height
             new_ops.append(
-                ([1, 0, 0, 1, pal_body_x, current_y], pikepdf.Operator("Tm")),
+                ([tm_a, tm_b, tm_c, tm_d, pal_body_x, current_y], pikepdf.Operator("Tm")),
             )
             new_ops.append(
                 _encode_line_as_tj(
@@ -915,13 +961,18 @@ def reflow_paragraph(
     new_para_text = paragraph.full_text.replace(match.matched_text, new_text, 1)
     new_para_text = new_para_text.replace("\n", " ")
 
-    # 2. Break into lines (re-wraps the continuous text to paragraph width)
+    # 2. Break into lines (re-wraps the continuous text to paragraph width).
+    # When font size is encoded in Tm (Tf=1, Tm=[fs,0,0,±fs,...]), the raw
+    # font_size is 1.0 but paragraph_width is in page-space (scaled by |a|).
+    # Multiply font_size by |tm_a| so line-breaking measurements match.
+    tm_scale = abs(paragraph.text_matrix_abcd[0]) if paragraph.text_matrix_abcd else 1.0
+    effective_font_size = paragraph.font_size * tm_scale
     lines = break_into_lines(
         new_para_text,
         paragraph.paragraph_width,
         font_resolver,
         font_ref,
-        paragraph.font_size,
+        effective_font_size,
     )
 
     # 3. Check encoding on the actual line content, extend font if needed
@@ -1078,6 +1129,8 @@ def reflow_paragraph(
         line_height=paragraph.line_height,
         resolver=font_resolver,
         page=page,
+        text_matrix_abcd=paragraph.text_matrix_abcd,
+        text_matrix_ef=paragraph.text_matrix_ef,
     )
 
     # 9. Splice: remove old operators, insert replacement

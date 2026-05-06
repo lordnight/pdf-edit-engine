@@ -42,6 +42,10 @@ _TTF_CANDIDATES = [
     Path("C:/Windows/Fonts/calibri.ttf"),
     Path("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"),
     Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+    Path("/System/Library/Fonts/Supplemental/Arial.ttf"),
+    Path("/System/Library/Fonts/Supplemental/Times New Roman.ttf"),
+    Path("/Library/Fonts/Arial Unicode.ttf"),
+    Path("/System/Library/Fonts/Geneva.ttf"),
 ]
 
 

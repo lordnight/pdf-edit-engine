@@ -165,3 +165,5 @@ class Paragraph:
     first_line_y: float
     line_count: int
     operator_indices: list[int]
+    text_matrix_abcd: tuple[float, float, float, float] | None = None
+    text_matrix_ef: tuple[float, float] | None = None

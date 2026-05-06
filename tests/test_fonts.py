@@ -472,8 +472,6 @@ class TestTier1_5GlyphInjection:
 
     def test_strip_glyph_hinting_simple_glyph(self) -> None:
         """_strip_glyph_hinting must zero out a glyph's program bytecode."""
-        from fontTools.ttLib import TTFont
-
         from pdf_edit_engine.fonts import _strip_glyph_hinting
 
         ttf = _find_ttf_for_cidfont()
@@ -492,8 +490,6 @@ class TestTier1_5GlyphInjection:
 
     def test_collect_component_names_simple_glyph(self) -> None:
         """A simple glyph (non-composite) must return an empty component list."""
-        from fontTools.ttLib import TTFont
-
         from pdf_edit_engine.fonts import _collect_component_names
 
         ttf = _find_ttf_for_cidfont()
@@ -509,8 +505,6 @@ class TestTier1_5GlyphInjection:
 
     def test_collect_component_names_composite_glyph(self) -> None:
         """A composite glyph (accented char) must return its component chain."""
-        from fontTools.ttLib import TTFont
-
         from pdf_edit_engine.fonts import _collect_component_names
 
         ttf = _find_ttf_for_cidfont()

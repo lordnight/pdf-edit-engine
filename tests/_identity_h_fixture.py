@@ -49,14 +49,14 @@ def _find_ttf_for_cidfont() -> Path | None:
     return None
 
 
-def _ttfont_open(path: Path) -> "ttLib.TTFont":
+def _ttfont_open(path: Path) -> ttLib.TTFont:
     """Open a TTFont, handling .ttc collections by selecting font index 0."""
-    from fontTools import ttLib
+    from fontTools.ttLib import TTFont
 
     kwargs: dict[str, int] = {}
     if path.suffix.lower() == ".ttc":
         kwargs["fontNumber"] = 0
-    return ttLib.TTFont(str(path), **kwargs)
+    return TTFont(str(path), **kwargs)
 
 
 _no_ttf = pytest.mark.skipif(
@@ -105,7 +105,6 @@ def _build_identity_h_pdf(
     if ttf_path is None:
         return False
 
-    from fontTools import ttLib
     from fontTools.subset import Subsetter
 
     full = _ttfont_open(ttf_path)

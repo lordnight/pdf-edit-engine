@@ -75,9 +75,8 @@ jobs:
         # passed: it promotes the editable-skip warning into an error,
         # which contradicts `--skip-editable`'s purpose.
         #
-        # `--ignore-vuln CVE-2026-3219` excludes a vulnerability in
-        # `pip` itself — `pip` is bundled with the GH Actions Python
-        # image, NOT a dependency we ship. CVE-2026-3219 has no fix
-        # version released yet (tracked upstream); revisit this ignore
-        # whenever a fixed pip release lands.
-        run: python -m pip_audit --skip-editable --ignore-vuln CVE-2026-3219
+        # `--ignore-vuln` excludes vulnerabilities in `pip` itself —
+        # `pip` is bundled with the GH Actions Python image, NOT a
+        # dependency we ship. Revisit these ignores whenever a fixed
+        # pip release lands.
+        run: python -m pip_audit --skip-editable --ignore-vuln CVE-2026-3219 --ignore-vuln CVE-2026-6357

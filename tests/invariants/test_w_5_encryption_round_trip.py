@@ -406,12 +406,11 @@ def test_inv_w_5_delete_block_on_encrypted_preserves_encryption(tmp_path: Path) 
     """``delete_block`` on an encrypted input preserves the CALLER's encryption.
 
     Regression guard for the structural cascade (adversarial-critic Point-3
-    gap): ``delete_block``'s MAIN deletion path must thread
-    ``reencrypt_password`` + surface ``encryption_dropped`` — else the output is
-    silently re-encrypted with an EMPTY password (the caller's protection
-    discarded, success=True). The output must require the caller's password, not
-    open for anyone. Pins the structural path, which the surgeon-only probes
-    above do not exercise.
+    gap): ``delete_block``'s MAIN deletion path must save through
+    ``_save_pdf`` + surface ``encryption_dropped`` — else the output silently
+    loses the caller's protection (success=True). The output must require the
+    caller's password, not open for anyone. Pins the structural path, which the
+    surgeon-only probes above do not exercise.
     """
     from pdf_edit_engine import delete_block
 

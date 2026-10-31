@@ -29,6 +29,7 @@ def _find_ttf_for_simple_font() -> Path | None:
         Path("C:/Windows/Fonts/ARIAL.TTF"),
         Path("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"),
         Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+        Path("/System/Library/Fonts/Supplemental/Arial.ttf"),
     ]
     for p in candidates:
         if p.exists():

@@ -31,6 +31,7 @@ from pdf_edit_engine.reflow import (
     _build_replacement_ops,
     _expand_to_bt_et,
     _find_bt_et_blocks,
+    _page_scales,
     _text_to_page_linear,
     break_into_lines,
 )
@@ -1486,10 +1487,16 @@ def _replace_block_on_page(
     # Detect body font (most common in region)
     font_size_was_auto = font_size is None
     det_name, det_size, fill_color = _detect_font_from_elements(matched_elems)
+    # The block is laid out in page space (the bbox, line height and
+    # positions are), so a detected Tf size is drawn at its page-space size:
+    # Tf 1 + Tm [12 0 0 -12 ...] or Tf 24 under a 0.5 CTM is 12pt text.
+    page_size_scale = next(
+        (_page_scales(e)[1] for e in matched_elems if e.type == "text" and e.characters), 1.0
+    )
     if font_name is None:
         font_name = det_name
     if font_size is None:
-        font_size = det_size
+        font_size = det_size * page_size_scale
 
     font_key = font_name if font_name.startswith("/") else f"/{font_name}"
     clean_name = font_name.lstrip("/")
@@ -1530,7 +1537,7 @@ def _replace_block_on_page(
             font_ref = page_obj["/Resources"]["/Font"][font_key]
             resolver = resolver_cache.get_resolver(page_obj, clean_name)
             if font_size_was_auto:
-                font_size = alt_size
+                font_size = alt_size * page_size_scale
             can_enc, missing = resolver.can_encode(encodable_text)
             font_switched = True
 
@@ -1911,6 +1918,17 @@ def _replace_block_on_page(
 
     # ── Phase 6: Write ───────────────────────────────────────────────
     insert_pos = min(removal_set)
+    # The replacement is page space; under a flipped or scaled CTM it is
+    # drawn through the inverse of the CTM in effect where it is inserted.
+    insert_ctm = _ctms_before_ops(ops)[insert_pos]
+    inverse_ctm = _mat_invert(insert_ctm) if insert_ctm != _IDENTITY else None
+    if inverse_ctm is not None:
+        replacement = [
+            ([], pikepdf.Operator("q")),
+            (list(inverse_ctm), pikepdf.Operator("cm")),
+            *replacement,
+            ([], pikepdf.Operator("Q")),
+        ]
     new_ops: _Ops = []
     inserted = False
     for i, op in enumerate(ops):

@@ -20,7 +20,7 @@ suppressed with "0pt available" and the paragraph overlapped what followed.
 from __future__ import annotations
 
 from decimal import Decimal
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import pikepdf
 import pytest
@@ -390,4 +390,40 @@ def test_a_watermark_underlay_does_not_suppress_the_shift(tmp_path: Path) -> Non
     underlay = [ops for ops in _content_ops(out) if ops[0] == "cm"]
     assert underlay == [ops for ops in _content_ops(src) if ops[0] == "cm"], (
         "the page-sized underlay must not move"
+    )
+
+
+def _replace_block_layout(
+    orientation: Orientation, fit: Literal["none", "shrink"], tmp_path: Path
+) -> list[tuple[str, float, frozenset[int], bool]]:
+    src = _page(orientation, tmp_path, footer_y=690)
+    out = tmp_path / f"{orientation.name}-{fit}.pdf"
+    result = replace_block(
+        str(src),
+        0,
+        (70.0, 738.0, 200.0, 754.0),
+        "Total: " + LONG_REPLACEMENT,
+        str(out),
+        fit=fit,
+    )
+    assert result.success, result
+    return [
+        (line.text, round(line.baseline, 1), line.sizes, line.upright) for line in page_lines(out)
+    ]
+
+
+@pytest.mark.parametrize("fit", ["none", "shrink"])
+@pytest.mark.parametrize(
+    "orientation",
+    [FLIP_NEGATIVE_D_TM, TM_SCALED, SCALED_CTM, CHROME_SCALED_FLIP],
+    ids=lambda o: o.name,
+)
+def test_replace_block_lays_out_like_an_identity_page(
+    orientation: Orientation, fit: Literal["none", "shrink"], tmp_path: Path
+) -> None:
+    expected = _replace_block_layout(IDENTITY, fit, tmp_path)
+
+    assert _replace_block_layout(orientation, fit, tmp_path) == expected, (
+        "replace_block must draw the new text at the page-space size and position, "
+        "upright, and move the footer as on an identity page"
     )

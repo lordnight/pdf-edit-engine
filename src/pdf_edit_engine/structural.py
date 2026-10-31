@@ -1154,7 +1154,6 @@ def shift_content_below(
             pdf,
             output_path,
             linearization_log=lin_log,
-            reencrypt_password=password,
             encryption_log=enc_log,
         )
         _invalidate_locator_cache()
@@ -2107,7 +2106,6 @@ def replace_block(
             pdf,
             output_path,
             linearization_log=lin_log,
-            reencrypt_password=password,
             encryption_log=enc_log,
         )
         _surface_linearization_dropped(result, lin_log)
@@ -2329,7 +2327,6 @@ def batch_replace_block(
             pdf,
             output_path,
             linearization_log=lin_log,
-            reencrypt_password=password,
             encryption_log=enc_log,
         )
         _invalidate_locator_cache()
@@ -2568,7 +2565,6 @@ def insert_text_block(
             pdf,
             output_path,
             linearization_log=lin_log,
-            reencrypt_password=password,
             encryption_log=enc_log,
         )
         _invalidate_locator_cache()
@@ -2644,7 +2640,6 @@ def delete_block(
                 pdf,
                 output_path,
                 linearization_log=lin_log,
-                reencrypt_password=password,
                 encryption_log=enc_log,
             )
             empty_result = EditResult(
@@ -2756,7 +2751,6 @@ def delete_block(
             pdf,
             output_path,
             linearization_log=main_lin_log,
-            reencrypt_password=password,
             encryption_log=main_enc_log,
         )
         _invalidate_locator_cache()

@@ -18,10 +18,10 @@ import re
 import sys
 import zlib
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any
 
 import pikepdf
-from pikepdf.models import EncryptionMethod, PdfParsingError
+from pikepdf.models import PdfParsingError
 
 from pdf_edit_engine.errors import (
     EncodingError,
@@ -564,85 +564,11 @@ _LINEARIZATION_DROPPED_DETAIL = "re-linearization failed; saved non-linearized"
 _ENCRYPTION_DROPPED_DETAIL = "re-encryption failed; saved unencrypted"
 
 
-def _mirrored_encryption(pdf: pikepdf.Pdf, password: str | bytes) -> pikepdf.Encryption:
-    """Build the ``pikepdf.Encryption`` that re-encrypts ``pdf`` the way it was encrypted.
-
-    Mirrors the input's ``R``, ``allow`` (``/P``), cipher and
-    ``/EncryptMetadata`` within what pikepdf can write: R 2 and 3 are RC4 with
-    the metadata always encrypted (pikepdf refuses ``aes`` and ``metadata``
-    below R 4, so both must be ``False``); R 4 is RC4 only when its crypt
-    filters use RC4 and no AES; R 5 and 6 are always AES. ``metadata`` is ``False`` only when
-    the input sets ``/EncryptMetadata false``. pikepdf cannot write an R 4 RC4
-    file that encrypts its metadata, so that one input keeps R 4 and its
-    encrypted metadata and is written as AES (the one scheme change, never a
-    weaker one). ``V`` and the key length follow from ``R`` and the cipher.
-
-    Args:
-        pdf: The open, encrypted input.
-        password: The caller's password, for owner and user, with its
-            original type (see ``_save_pdf``).
-
-    Returns:
-        The encryption to pass to ``pikepdf.Pdf.save``.
-    """
-    info = pdf.encryption
-    # ``info.R`` is an ``int`` per pikepdf's stub, but ``Encryption(R=...)``
-    # narrows to ``Literal[2,3,4,5,6]``. R read from a real encrypted file is
-    # always in that range, so the cast is honest (not a value override).
-    revision = cast("Literal[2, 3, 4, 5, 6]", info.R)
-    encrypt_dict = pdf.trailer.get("/Encrypt")
-    metadata_encrypted = (
-        not isinstance(encrypt_dict, pikepdf.Dictionary)
-        or encrypt_dict.get("/EncryptMetadata", True) is not False
-    )
-    methods = (info.stream_method, info.string_method)
-    rc4_only = EncryptionMethod.rc4 in methods and EncryptionMethod.aes not in methods
-    if revision < 4:
-        aes = False
-        metadata = False
-    elif revision == 4:
-        aes = not rc4_only or metadata_encrypted
-        metadata = metadata_encrypted
-    else:
-        aes = True
-        metadata = metadata_encrypted
-    return pikepdf.Encryption(
-        owner=password,  # type: ignore[arg-type]  # str|bytes ok at runtime; bytes must pass through (R=6)
-        user=password,  # type: ignore[arg-type]
-        R=revision,
-        allow=pdf.allow,
-        aes=aes,
-        metadata=metadata,
-    )
-
-
-def _drop_injected_encryption(
-    exc: Exception, save_kwargs: dict[str, Any], encryption_log: list[str] | None
-) -> None:
-    """Remove the encryption ``_save_pdf`` injected and record the loss.
-
-    Args:
-        exc: What pikepdf raised on the encrypted save (its type is logged,
-            never its text, F-C-03 / INV-W0-9).
-        save_kwargs: The save keyword arguments; ``encryption`` is removed.
-        encryption_log: When given, ``_ENCRYPTION_DROPPED_DETAIL`` is appended
-            so the edit verb surfaces an ``encryption_dropped`` Degradation.
-    """
-    logger.info(
-        "pdf.save(encryption=...) failed with %s; retrying unencrypted (INV-W-5 fallback)",
-        type(exc).__name__,
-    )
-    if encryption_log is not None:
-        encryption_log.append(_ENCRYPTION_DROPPED_DETAIL)
-    save_kwargs.pop("encryption", None)
-
-
 def _save_pdf(
     pdf: pikepdf.Pdf,
     output_path: str | Path,
     *,
     linearization_log: list[str] | None = None,
-    reencrypt_password: str | bytes | None = None,
     encryption_log: list[str] | None = None,
     **save_kwargs: Any,
 ) -> None:
@@ -682,24 +608,22 @@ def _save_pdf(
     caller did not already pin an explicit ``encryption`` in ``save_kwargs``,
     so ``wrapper.encrypt_pdf``'s explicit ``encryption=`` still wins and
     ``wrapper.decrypt_pdf``'s explicit ``encryption=False`` opt-out is
-    honoured), it re-encrypts the output with the ``pikepdf.Encryption`` that
-    ``_mirrored_encryption`` builds from the input's ``R``, ``allow``
-    (permission bitmask), cipher and ``/EncryptMetadata``, and the
-    caller-supplied ``reencrypt_password`` for BOTH owner and user. A
-    NON-encrypted input never sets ``encryption``, so its save call is
-    byte-identical to the pre-A2.3 behaviour (zero blast radius). DOCUMENTED
-    BOUNDARIES (NOT per-edit degradations): the owner password is NOT
-    recoverable from an opened pikepdf document, so a distinct owner!=user pair
-    collapses to the single caller password; ``/P`` is preserved STRUCTURALLY
-    (mirrored via ``allow=``) but is advisory because pikepdf does not enforce
-    permissions. If pikepdf raises ``pikepdf.PdfError`` or ``ValueError`` on
-    the encrypted save, the helper retries ONCE WITHOUT ``encryption`` (so the
-    edit still lands) and appends ``_ENCRYPTION_DROPPED_DETAIL`` to
-    ``encryption_log`` when one was supplied (so an edit verb can surface a
-    typed ``encryption_dropped`` Degradation), else logs the drop at INFO. An
-    ``OSError`` from the encrypted save is NOT caught here — it falls through
-    to the outer translator identically to W-3 (INV-L-1 / F-C-03: no raw
-    OSError, no path leak).
+    honoured), it saves with ``encryption=True``: qpdf copies the input's
+    encryption parameters (``R``, ``V``, key length, ``/O``, ``/U``, ``/P``,
+    ``/EncryptMetadata``, the first ``/ID`` and the file key), so the output
+    opens with exactly the passwords that opened the input, owner and user
+    keep their roles, and no password is re-encoded. The one scheme change is
+    qpdf's: a ``V 4`` file whose crypt filters use RC4 is written with AESV2
+    under the same key. A NON-encrypted input never sets ``encryption``, so
+    its save call is byte-identical to the pre-A2.3 behaviour (zero blast
+    radius). ``/P`` is advisory because pikepdf does not enforce permissions.
+    If pikepdf raises ``pikepdf.PdfError`` on the encrypted save, the helper
+    retries ONCE WITHOUT ``encryption`` (so the edit still lands) and appends
+    ``_ENCRYPTION_DROPPED_DETAIL`` to ``encryption_log`` when one was supplied
+    (so an edit verb can surface a typed ``encryption_dropped`` Degradation),
+    else logs the drop at INFO. An ``OSError`` from the encrypted save is NOT
+    caught here — it falls through to the outer translator identically to W-3
+    (INV-L-1 / F-C-03: no raw OSError, no path leak).
 
     Args:
         pdf: An open ``pikepdf.Pdf`` to serialize.
@@ -711,14 +635,6 @@ def _save_pdf(
             ``linearization_dropped`` Degradation. When ``None`` (the
             default — wrapper/annotation verbs that carry no
             ``FidelityReport``), the fallback is logged only.
-        reencrypt_password: The password the calling verb used to OPEN the
-            (possibly encrypted) input. This is how the re-encryption password
-            reaches the helper so ALL encryption logic stays inside
-            ``_pathutil`` (INV-L-1 spirit). Bytes are decoded ``latin-1``
-            (lossless for any byte sequence). When ``None``/``""`` on an
-            encrypted input, ``pikepdf.Encryption(owner="", user="")`` is the
-            honest best-effort (still structurally encrypted). Ignored for a
-            non-encrypted input.
         encryption_log: Optional out-parameter mirroring
             ``linearization_log``. When provided and re-encryption fell back
             to an unencrypted save, ``_ENCRYPTION_DROPPED_DETAIL`` is appended
@@ -738,53 +654,18 @@ def _save_pdf(
     # ``encryption`` explicitly — ``wrapper.encrypt_pdf`` pins its own
     # ``encryption=`` (which wins), and ``wrapper.decrypt_pdf`` pins
     # ``encryption=False`` to OPT OUT of this auto-preservation.
-    was_encrypted = bool(pdf.is_encrypted)
-    if was_encrypted and "encryption" not in save_kwargs:
-        # The owner password is NOT recoverable from an opened pikepdf
-        # document, and ``user_password`` is recoverable ONLY when the file was
-        # opened with the USER password (it is ``b''`` when opened with the
-        # owner password). The HONEST, deterministic choice is to re-encrypt
-        # with the password the CALLER supplied, for owner AND user.
-        # Consequence (documented boundary, NOT a per-edit degradation): a file
-        # with a distinct owner!=user pair collapses to a single caller
-        # password, and ``/P`` is preserved STRUCTURALLY (mirrored via
-        # ``allow=``) but is advisory only because pikepdf does not enforce
-        # permissions.
-        # Pass the caller's password through WITH ITS ORIGINAL TYPE (str or
-        # bytes). pikepdf.Encryption owner/user are typed ``str`` but accept
-        # ``bytes`` at runtime. We must NOT decode bytes->str: pikepdf's R=6
-        # (AES-256) key derivation hashes a ``bytes`` password from its RAW
-        # bytes but a ``str`` password from its UTF-8 encoding, so decoding a
-        # non-ASCII bytes password to str (even losslessly via latin-1) would
-        # re-encrypt under a DIFFERENT key than the caller used to open the
-        # file — silently locking them out of their own output (success=True,
-        # no degradation). Passing the original type keeps open-time and
-        # re-encrypt-time hashing identical.
-        pw: str | bytes = reencrypt_password if reencrypt_password is not None else ""
-        save_kwargs["encryption"] = _mirrored_encryption(pdf, pw)
+    injected_encryption = bool(pdf.is_encrypted) and "encryption" not in save_kwargs
+    if injected_encryption:
+        save_kwargs["encryption"] = True
 
     # A2.2 / INV-W-3: detect the input's linearization once, before save, and
     # ask pikepdf to preserve it. Only when the caller has not already pinned
     # ``linearize`` explicitly (e.g. a deterministic corpus builder).
     was_linearized = bool(pdf.is_linearized)
-    # True iff WE injected the ``encryption`` kwarg above (so the genuine-
-    # encryption-failure fallback applies). A caller-pinned ``encryption`` (or
-    # the ``encryption=False`` decrypt opt-out) is NOT a ``pikepdf.Encryption``
-    # we built, so it does NOT enable the fallback.
-    injected_encryption = was_encrypted and isinstance(
-        save_kwargs.get("encryption"), pikepdf.Encryption
-    )
     try:
         if was_linearized and "linearize" not in save_kwargs:
             try:
-                try:
-                    pdf.save(str(output_path), linearize=True, **save_kwargs)
-                except ValueError as exc:
-                    if not injected_encryption:
-                        raise
-                    _drop_injected_encryption(exc, save_kwargs, encryption_log)
-                    injected_encryption = False
-                    pdf.save(str(output_path), linearize=True, **save_kwargs)
+                pdf.save(str(output_path), linearize=True, **save_kwargs)
                 return
             except pikepdf.PdfError:
                 # Re-linearization failed (a can't-linearize failure, NOT an
@@ -806,7 +687,7 @@ def _save_pdf(
                     linearization_log.append(_LINEARIZATION_DROPPED_DETAIL)
         try:
             pdf.save(str(output_path), **save_kwargs)
-        except (pikepdf.PdfError, ValueError) as exc:
+        except pikepdf.PdfError:
             if not injected_encryption:
                 raise
             # A2.3 / INV-W-5 honest fallback: re-encryption could not be
@@ -815,7 +696,13 @@ def _save_pdf(
             # outer translator). Retry WITHOUT encryption so the edit still
             # succeeds, and record the loss so the verb surfaces a typed
             # ``encryption_dropped`` Degradation.
-            _drop_injected_encryption(exc, save_kwargs, encryption_log)
+            logger.info(
+                "pdf.save(encryption=...) failed; retrying unencrypted (INV-W-5 fallback)",
+                exc_info=True,
+            )
+            if encryption_log is not None:
+                encryption_log.append(_ENCRYPTION_DROPPED_DETAIL)
+            save_kwargs.pop("encryption", None)
             pdf.save(str(output_path), **save_kwargs)
     except pikepdf.PdfError as exc:
         # F-C-03 / INV-W0-9: %s of an exception object renders str(exc),

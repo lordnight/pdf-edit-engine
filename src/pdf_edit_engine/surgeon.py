@@ -2142,7 +2142,6 @@ def replace(
                                 pdf,
                                 output_path,
                                 linearization_log=lin_log,
-                                reencrypt_password=password,
                                 encryption_log=enc_log,
                             )
                             _surface_linearization_dropped(result, lin_log)
@@ -2200,7 +2199,6 @@ def replace(
                 pdf,
                 output_path,
                 linearization_log=simple_lin_log,
-                reencrypt_password=password,
                 encryption_log=simple_enc_log,
             )
             _surface_linearization_dropped(result, simple_lin_log)
@@ -2412,7 +2410,6 @@ def replace_all(
                 pdf,
                 output_path,
                 linearization_log=lin_log,
-                reencrypt_password=password,
                 encryption_log=enc_log,
             )
             _surface_linearization_dropped(results, lin_log)
@@ -2592,7 +2589,6 @@ def batch_replace(
                 pdf,
                 output_path,
                 linearization_log=lin_log,
-                reencrypt_password=password,
                 encryption_log=enc_log,
             )
 

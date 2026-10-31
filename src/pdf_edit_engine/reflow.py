@@ -1873,7 +1873,7 @@ def reflow_paragraph(
         # Import locally to avoid cross-module boundary noise at import
         # time. structural owns the shift primitive; we borrow it.
         from pdf_edit_engine.locator import _build_index as _reflow_build_index
-        from pdf_edit_engine.structural import _page_y_extent, _shift_content_below_inplace
+        from pdf_edit_engine.structural import _page_extents_below, _shift_content_below_inplace
 
         # Everything here is PAGE space (y up from the MediaBox bottom), the
         # space the shift primitive and the clamp work in: line_height is a
@@ -1899,15 +1899,16 @@ def reflow_paragraph(
         mediabox = page.get("/MediaBox")
         if mediabox is not None:
             page_bottom = float(mediabox[1])
-            # Bottoms of everything that draws below the paragraph, in page
-            # space. Elements that draw nothing (color state changes and empty
-            # paths, whose bbox is all zeros) must not count, or such a page
-            # reads as "content at y=0" and the shift is suppressed.
-            below_bottoms: list[float] = []
-            for e in _reflow_build_index(page, paragraph.elements[0].page):
-                extent = _page_y_extent(e)
-                if extent is not None and extent[0] < paragraph_bottom_y:
-                    below_bottoms.append(extent[0])
+            # Bottoms of everything that draws wholly below the paragraph, in
+            # page space: the elements the shift moves.
+            below_bottoms = [
+                bottom
+                for bottom, _top in _page_extents_below(
+                    _reflow_build_index(page, paragraph.elements[0].page),
+                    page,
+                    paragraph_bottom_y,
+                )
+            ]
             if below_bottoms:
                 lowest_y = min(below_bottoms)
                 max_safe_shift = lowest_y - page_bottom

@@ -762,14 +762,51 @@ def _point_moved_down(
     return new_operands
 
 
-def _page_y_extent(elem: ContentElement) -> tuple[float, float] | None:
+_UNIT_SQUARE: tuple[tuple[float, float], ...] = ((0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0))
+
+_PATH_CONSTRUCTION_OPS = frozenset({"m", "l", "c", "v", "y", "re", "h"})
+_PATH_PAINTING_OPS = frozenset({"S", "s", "f", "F", "f*", "B", "B*", "b", "b*", "n"})
+
+
+def _xobject_corners(page_obj: pikepdf.Page, name: str) -> tuple[tuple[float, float], ...]:
+    """Corners of what an XObject draws, in the space its ``Do`` places it in.
+
+    An image fills the unit square; a Form XObject draws inside its /BBox
+    mapped through its /Matrix. A form without a readable /BBox falls back
+    to the unit square.
+    """
+    try:
+        xobject = page_obj["/Resources"]["/XObject"][f"/{name.lstrip('/')}"]
+        if str(xobject.get("/Subtype")) != "/Form":
+            return _UNIT_SQUARE
+        x0, y0, x1, y1 = (float(v) for v in xobject["/BBox"])
+        matrix_obj = xobject.get("/Matrix")
+        matrix: _Matrix = (
+            _IDENTITY
+            if matrix_obj is None
+            else (
+                float(matrix_obj[0]),
+                float(matrix_obj[1]),
+                float(matrix_obj[2]),
+                float(matrix_obj[3]),
+                float(matrix_obj[4]),
+                float(matrix_obj[5]),
+            )
+        )
+    except (KeyError, TypeError, ValueError, IndexError):
+        return _UNIT_SQUARE
+    return tuple(_transform_point(matrix, x, y) for x in (x0, x1) for y in (y0, y1))
+
+
+def _page_y_extent(elem: ContentElement, page_obj: pikepdf.Page) -> tuple[float, float] | None:
     """Page-space ``(bottom, top)`` of a located element, ``None`` if it draws nothing.
 
     The locator's bbox mixes spaces (a path's is raw user space, a text run's
     height uses the Tf size and assumes upright glyphs), so it cannot be
     compared with page-space positions under a flipped or scaled CTM. Color
     state changes carry an all-zero bbox and draw nothing; neither does a
-    path with no construction points.
+    path with no construction points or one ended by ``n`` (a clipping path
+    that paints nothing).
     """
     ctm = elem.graphics_state.ctm
     if elem.type == "text" and elem.characters:
@@ -781,14 +818,87 @@ def _page_y_extent(elem: ContentElement) -> tuple[float, float] | None:
             for rise in (-0.25, 0.75)
         ]
         return (min(ys), max(ys))
-    if elem.type == "path" and elem.bbox != (0.0, 0.0, 0.0, 0.0):
+    if elem.type == "path" and elem.bbox != (0.0, 0.0, 0.0, 0.0) and elem.paint_operator != "n":
         x0, y0, x1, y1 = elem.bbox
         ys = [_transform_point(ctm, x, y)[1] for x in (x0, x1) for y in (y0, y1)]
         return (min(ys), max(ys))
     if elem.type in ("image", "xobject"):
-        ys = [_transform_point(ctm, x, y)[1] for x in (0.0, 1.0) for y in (0.0, 1.0)]
+        corners = _xobject_corners(page_obj, elem.xobject_name or "")
+        ys = [_transform_point(ctm, x, y)[1] for x, y in corners]
         return (min(ys), max(ys))
     return None
+
+
+def _page_extents_below(
+    elements: list[ContentElement], page_obj: pikepdf.Page, y_threshold: float
+) -> list[tuple[float, float]]:
+    """Page-space extents of the drawn elements that lie wholly below *y_threshold*.
+
+    An element that reaches up to the threshold or above it (a page
+    background, a frame, an underlay, a margin clip, a shaded row behind the
+    edited line) is not below the paragraph: the shift leaves it in place,
+    so it must not limit how far the content below can move either.
+    """
+    return [
+        extent
+        for extent in (_page_y_extent(elem, page_obj) for elem in elements)
+        if extent is not None and extent[1] < y_threshold
+    ]
+
+
+def _path_op_points(op_str: str, operands: list[Any]) -> list[tuple[int, int]]:
+    """Operand index pairs of the points a path construction op adds."""
+    if op_str in ("m", "l") and len(operands) >= 2:
+        return [(0, 1)]
+    if op_str == "c" and len(operands) >= 6:
+        return [(0, 1), (2, 3), (4, 5)]
+    if op_str in ("v", "y") and len(operands) >= 4:
+        return [(0, 1), (2, 3)]
+    return []
+
+
+def _move_path_down(
+    ops: _Ops,
+    op_indices: list[int],
+    ctms: list[_Matrix],
+    y_threshold: float,
+    delta_y: float,
+) -> None:
+    """Move one path object down the page when all of it lies below *y_threshold*."""
+    page_ys: list[float] = []
+    for i in op_indices:
+        op_str = _get_op_str(ops[i])
+        operands = _get_operands(ops[i])
+        if op_str == "re" and len(operands) >= 4:
+            x, y = float(operands[0]), float(operands[1])
+            w, h = float(operands[2]), float(operands[3])
+            page_ys.extend(
+                _transform_point(ctms[i], cx, cy)[1] for cx in (x, x + w) for cy in (y, y + h)
+            )
+        for xi, yi in _path_op_points(op_str, operands):
+            page_ys.append(_transform_point(ctms[i], float(operands[xi]), float(operands[yi]))[1])
+    if not page_ys or max(page_ys) >= y_threshold:
+        return
+    for i in op_indices:
+        inst = ops[i]
+        op_str = _get_op_str(inst)
+        operands = _get_operands(inst)
+        operator = inst.operator if hasattr(inst, "operator") else inst[1]
+        delta = _page_down_delta(ctms[i], delta_y)
+        if delta is None:
+            continue
+        points = [(0, 1)] if op_str == "re" and len(operands) >= 4 else []
+        points += _path_op_points(op_str, operands)
+        if not points:
+            continue
+        new_operands = list(operands)
+        for xi, yi in points:
+            if delta[0] != 0.0:
+                new_operands[xi] = pikepdf.Object.parse(
+                    str(float(operands[xi]) + delta[0]).encode()
+                )
+            new_operands[yi] = pikepdf.Object.parse(str(float(operands[yi]) + delta[1]).encode())
+        ops[i] = (new_operands, operator)
 
 
 def _shift_content_below_inplace(
@@ -873,7 +983,27 @@ def _shift_content_below_inplace(
             seen_positioning_in_block = True
             continue
 
-    # ── Paths: shift coordinates directly ────────────────────────────
+    # ── Paths: a path object moves as a whole ────────────────────────
+    #
+    # A path object is its construction ops up to the painting op (a
+    # clipping path included). It moves when all of it lies below the
+    # threshold in page space; one that reaches up to the threshold or
+    # above it spans the paragraph (a background, frame or clip) and stays.
+    path_op_indices: list[int] = []
+    for i in range(len(ops)):
+        op_str = _get_op_str(ops[i])
+        if op_str in _PATH_CONSTRUCTION_OPS:
+            path_op_indices.append(i)
+            continue
+        if op_str in ("W", "W*"):
+            continue
+        if path_op_indices:
+            _move_path_down(ops, path_op_indices, ctms, y_threshold, delta_y)
+            path_op_indices = []
+    if path_op_indices:
+        _move_path_down(ops, path_op_indices, ctms, y_threshold, delta_y)
+
+    # ── XObjects: move the placing cm ────────────────────────────────
     for i in range(len(ops)):
         inst = ops[i]
         op_str = _get_op_str(inst)
@@ -881,54 +1011,24 @@ def _shift_content_below_inplace(
         operator = inst.operator if hasattr(inst, "operator") else inst[1]
         ctm = ctms[i]
 
-        if op_str in ("m", "l") and len(operands) >= 2:
-            moved = _point_moved_down(operands, 0, 1, ctm, y_threshold, delta_y)
-            if moved is not None:
-                ops[i] = (moved, operator)
-
-        elif op_str in ("c", "v", "y") and len(operands) >= (6 if op_str == "c" else 4):
-            # Shift each control point that lies below the threshold.
-            new_operands = list(operands)
-            changed = False
-            for pi in range(0, 6 if op_str == "c" else 4, 2):
-                moved = _point_moved_down(new_operands, pi, pi + 1, ctm, y_threshold, delta_y)
-                if moved is not None:
-                    new_operands = moved
-                    changed = True
-            if changed:
-                ops[i] = (new_operands, operator)
-
-        elif op_str == "re" and len(operands) >= 4:
-            # A rectangle moves as a whole when its page-space bottom edge
-            # is below the threshold.
-            x, y = float(operands[0]), float(operands[1])
-            w, h = float(operands[2]), float(operands[3])
-            bottom = min(_transform_point(ctm, cx, cy)[1] for cx in (x, x + w) for cy in (y, y + h))
-            delta = _page_down_delta(ctm, delta_y)
-            if bottom < y_threshold and delta is not None:
-                new_operands = list(operands)
-                if delta[0] != 0.0:
-                    new_operands[0] = pikepdf.Object.parse(str(x + delta[0]).encode())
-                new_operands[1] = pikepdf.Object.parse(str(y + delta[1]).encode())
-                ops[i] = (new_operands, operator)
-
-        elif op_str == "cm" and len(operands) >= 6:
+        if op_str == "cm" and len(operands) >= 6:
             # Only shift cm if it precedes a Do (image placement).
             # General CTM setups (identity, page-level transforms)
             # must NOT be shifted — they'd corrupt all subsequent content.
-            next_is_do = False
+            do_operands: list[Any] | None = None
             for j in range(i + 1, min(i + 4, len(ops))):
                 nop = _get_op_str(ops[j])
                 if nop == "Do":
-                    next_is_do = True
+                    do_operands = _get_operands(ops[j])
                     break
                 if nop not in ("q", "Q", "gs"):
                     break
-            if next_is_do:
-                # The XObject's unit square is placed by this cm on top of
-                # the enclosing CTM; it moves when its page-space bottom edge
-                # is below the threshold, by a displacement in the enclosing
-                # CTM's user space (where the cm translation lives).
+            if do_operands:
+                # What the XObject draws (an image's unit square, a form's
+                # /BBox through its /Matrix) is placed by this cm on top of
+                # the enclosing CTM; it moves when all of it is below the
+                # threshold in page space, by a displacement in the
+                # enclosing CTM's user space (where the cm translation lives).
                 placed = _mat_mult(
                     (
                         float(operands[0]),
@@ -940,11 +1040,12 @@ def _shift_content_below_inplace(
                     ),
                     ctm,
                 )
-                bottom = min(
-                    _transform_point(placed, ux, uy)[1] for ux in (0.0, 1.0) for uy in (0.0, 1.0)
+                top = max(
+                    _transform_point(placed, ux, uy)[1]
+                    for ux, uy in _xobject_corners(page_obj, str(do_operands[0]))
                 )
                 delta = _page_down_delta(ctm, delta_y)
-                if bottom < y_threshold and delta is not None:
+                if top < y_threshold and delta is not None:
                     new_operands = list(operands)
                     if delta[0] != 0.0:
                         new_operands[4] = pikepdf.Object.parse(
@@ -989,10 +1090,9 @@ def _shift_content_below_inplace(
         page_bottom = float(mediabox[1])
         # Re-parse to check final positions
         elements = _build_index(page_obj, page_num)
-        for elem in elements:
-            extent = _page_y_extent(elem)
-            if extent is not None and extent[0] < page_bottom:
-                overshoot = page_bottom - extent[0]
+        for bottom, _top in _page_extents_below(elements, page_obj, y_threshold - delta_y):
+            if bottom < page_bottom:
+                overshoot = page_bottom - bottom
                 warnings.append(f"Content shifted below page boundary by {overshoot:.1f}pt")
                 break
     return warnings
@@ -1713,11 +1813,7 @@ def _replace_block_on_page(
         mediabox = page_obj.get("/MediaBox")
         if mediabox is not None:
             page_bottom = float(mediabox[1])
-            below_ys = [
-                extent[0]
-                for extent in map(_page_y_extent, elements)
-                if extent is not None and extent[0] < bbox[1]
-            ]
+            below_ys = [bottom for bottom, _top in _page_extents_below(elements, page_obj, bbox[1])]
             if below_ys:
                 lowest_y = min(below_ys)
                 max_safe_shift = lowest_y - page_bottom

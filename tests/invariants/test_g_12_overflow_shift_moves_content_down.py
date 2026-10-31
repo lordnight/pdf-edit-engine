@@ -6,7 +6,8 @@ and not overlap the reflowed lines, whatever the CTM and text-matrix
 orientation. The shift and its on-page clamp work in page space: the shift
 primitive maps each operand through the CTM in effect at its operator, and the
 clamp measures what is below by page-space extents of elements that draw
-something.
+something. Only content wholly below the paragraph moves or limits the shift;
+a background, frame, underlay or margin clip that reaches above it stays.
 
 Regression guard — on the pre-fix engine a Y-flip CTM (``cm 1 0 0 -1 0 h``)
 turned the shift around (``y - delta`` in flipped user space moves content UP,
@@ -18,6 +19,7 @@ suppressed with "0pt available" and the paragraph overlapped what followed.
 
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import TYPE_CHECKING
 
 import pikepdf
@@ -25,7 +27,7 @@ import pytest
 from pdfminer.high_level import extract_pages
 from pdfminer.layout import LTCurve, LTImage
 
-from pdf_edit_engine import find, replace, replace_block, shift_content_below
+from pdf_edit_engine import add_watermark, find, replace, replace_block, shift_content_below
 from tests._flipped_page_fixture import (
     FLIP_IDENTITY_TM,
     FLIP_NEGATIVE_D_TM,
@@ -33,12 +35,14 @@ from tests._flipped_page_fixture import (
     FLIP_UNIT_TM,
     IDENTITY,
     PAGE_FONT_SIZE,
+    PAGE_HEIGHT,
     SCALED_CTM,
     TM_SCALED,
     Orientation,
     build_page_pdf,
     page_lines,
 )
+from tests.harness.diff_render import render_page, requires_render
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -51,6 +55,7 @@ LONG_REPLACEMENT = (
 )
 PARAGRAPH = "Total: 100 units"
 FOOTER = "Footer line stays"
+HEADER = "Header line stays"
 LINE_HEIGHT = PAGE_FONT_SIZE * 1.2
 _TOL = 0.5
 
@@ -276,3 +281,107 @@ def test_replace_block_clamp_ignores_elements_that_draw_nothing(tmp_path: Path) 
         f"a page with room below must not report 0pt available; got kinds={kinds}"
     )
     assert _footer(page_lines(out)).baseline < 690 - _TOL, "the footer must move down"
+
+
+def _content_ops(path: Path) -> list[tuple[str, list[float]]]:
+    with pikepdf.open(str(path)) as pdf:
+        return [
+            (str(operator), [float(v) for v in operands if isinstance(v, (int, float, Decimal))])
+            for operands, operator in pikepdf.parse_content_stream(pdf.pages[0])
+        ]
+
+
+def _rects(path: Path) -> list[list[float]]:
+    return [operands for op, operands in _content_ops(path) if op == "re"]
+
+
+def _line_has_ink(path: Path, line: Line) -> bool:
+    image = render_page(path, scale=2.0).convert("L")
+    top = round((PAGE_HEIGHT - line.y1) * 2)
+    bottom = round((PAGE_HEIGHT - line.y0) * 2)
+    band = image.crop((144, max(top, 0), 600, max(bottom, top + 1)))
+    return band.getextrema()[0] < 128
+
+
+def _assert_footer_moved_clear(src: Path, out: Path, result: EditResult, footer_y: float) -> None:
+    kinds = {d.kind for d in result.fidelity_report.degradations}
+    assert not kinds & {"overflow_shift_suppressed", "overflow_shift_clamped"}, (
+        f"content spanning the paragraph must not limit the shift; warnings={result.warnings!r}"
+    )
+    lines = page_lines(out)
+    paragraph = [line for line in _paragraph_lines(lines) if line.text != HEADER]
+    footer = _footer(lines)
+    added = len(paragraph) - 1
+    assert added > 0, "the long replacement must add lines"
+    assert footer_y - footer.baseline == pytest.approx(added * LINE_HEIGHT, abs=_TOL)
+    assert footer.y1 <= paragraph[-1].y0 + _TOL, (
+        f"footer (top y={footer.y1:.1f}) overlaps the last reflowed line "
+        f"(bottom y={paragraph[-1].y0:.1f})"
+    )
+
+
+@pytest.mark.parametrize(
+    ("orientation", "prologue"),
+    [
+        (IDENTITY, b"q 1 g 0 0 595 842 re f Q\n"),
+        (FLIP_NEGATIVE_D_TM, b"q 1 g 0 0 595 842 re f Q\n"),
+        (IDENTITY, b"q 0 G 20 20 555 802 re S Q\n"),
+        (IDENTITY, b"q 0.85 g 66 737 200 18 re f Q\n"),
+    ],
+    ids=["background", "flipped_background", "page_frame", "shaded_row_behind_line"],
+)
+def test_elements_spanning_the_paragraph_stay_and_do_not_limit_the_shift(
+    orientation: Orientation, prologue: bytes, tmp_path: Path
+) -> None:
+    src = _page(orientation, tmp_path, footer_y=690, prologue=prologue)
+    out = tmp_path / "out.pdf"
+
+    result = _reflow(src, out)
+
+    _assert_footer_moved_clear(src, out, result, footer_y=690)
+    assert _rects(out) == _rects(src), "a rectangle reaching above the paragraph must not move"
+
+
+@requires_render
+@pytest.mark.parametrize("orientation", [IDENTITY, FLIP_NEGATIVE_D_TM], ids=lambda o: o.name)
+def test_a_margin_clip_stays_put_and_the_reflowed_lines_stay_visible(
+    orientation: Orientation, tmp_path: Path
+) -> None:
+    # Chrome wraps the page body in a margin clip ("re W* n") that spans the
+    # page: the shift must neither move it nor read its bottom edge as content.
+    clip = b"q 36 36 523 770 re W* n\n"
+    src = build_page_pdf(
+        tmp_path / "in.pdf",
+        orientation.prologue()
+        + clip
+        + orientation.run(72, 790, HEADER)
+        + orientation.run(72, 742, PARAGRAPH)
+        + orientation.run(72, 690, FOOTER)
+        + b"Q\n",
+    )
+    out = tmp_path / "out.pdf"
+
+    result = _reflow(src, out)
+
+    _assert_footer_moved_clear(src, out, result, footer_y=690)
+    assert _rects(out) == _rects(src), "the margin clip must not move"
+    for line in page_lines(out):
+        assert _line_has_ink(out, line), f"line {line.text!r} has no ink in the render"
+
+
+def test_a_watermark_underlay_does_not_suppress_the_shift(tmp_path: Path) -> None:
+    page = _page(IDENTITY, tmp_path, footer_y=690)
+    mark = build_page_pdf(
+        tmp_path / "mark.pdf", b"BT /F1 48 Tf 0.9 g 100 400 Td (DRAFT) Tj ET\n"
+    )
+    src = tmp_path / "watermarked.pdf"
+    add_watermark(str(page), str(mark), str(src))
+    out = tmp_path / "out.pdf"
+
+    result = _reflow(src, out)
+
+    _assert_footer_moved_clear(src, out, result, footer_y=690)
+    underlay = [ops for ops in _content_ops(out) if ops[0] == "cm"]
+    assert underlay == [ops for ops in _content_ops(src) if ops[0] == "cm"], (
+        "the page-sized underlay must not move"
+    )

@@ -592,6 +592,7 @@ class ContentElement:
     xobject_name: str | None = None
     path_data: list[object] | None = None
     characters: list[TextCharacter] | None = None
+    paint_operator: str | None = None
 
 
 @dataclass(frozen=True)

@@ -297,16 +297,14 @@ def test_shift_v_y_path_operators_above_threshold_unchanged(tmp_path: Path) -> N
     pdf.close()
 
 
-def test_shift_bezier_curves_partial_only_below_y_shifted(tmp_path: Path) -> None:
-    """`c` op with mixed above/below threshold y-coords: only below-threshold get shifted.
+def test_shift_bezier_curve_reaching_above_threshold_stays_whole(tmp_path: Path) -> None:
+    """A `c` path with a control point above the threshold spans it and is left whole.
 
-    Exercises the inner-loop branch where ``val < y_threshold`` is False for some
-    indices in (1, 3, 5) — the ``new_operands[yi] = ...`` write is skipped for
-    those indices while the others move. Without this test the
-    ``546->544`` partial branch in structural.py stays uncovered.
+    Moving only its below-threshold points would warp the curve; a path that
+    reaches up past the paragraph bottom is not content below it.
     """
     pdf, page = _new_blank_pdf()
-    # y1=605 (below 700, shifts), y2=720 (above, unchanged), y3=610 (below, shifts).
+    # y1=605 (below 700), y2=720 (above), y3=610 (below): the path spans 700.
     page.Contents = pdf.make_stream(b"100 600 m 110 605 130 720 150 610 c S\n")
 
     delta_y = 30.0
@@ -323,19 +321,14 @@ def test_shift_bezier_curves_partial_only_below_y_shifted(tmp_path: Path) -> Non
     assert len(c_ops) == 1
     operands = c_ops[0].operands if hasattr(c_ops[0], "operands") else c_ops[0][0]
     ys = [float(operands[j]) for j in (1, 3, 5)]
-    # 605 -> 575, 720 -> 720 (untouched), 610 -> 580.
-    assert ys == [575.0, 720.0, 580.0]
+    assert ys == [605.0, 720.0, 610.0]
     pdf.close()
 
 
-def test_shift_v_y_partial_only_below_y_shifted(tmp_path: Path) -> None:
-    """`v` op with mixed above/below threshold: only the below-threshold y shifts.
-
-    Same rationale as the `c` partial test but for the 4-operand `v` / `y`
-    branch (covers the ``556->554`` partial branch).
-    """
+def test_shift_v_path_reaching_above_threshold_stays_whole(tmp_path: Path) -> None:
+    """A `v` path with a point above the threshold is left whole, like the `c` case."""
     pdf, page = _new_blank_pdf()
-    # `v`: y1=720 (above 700, unchanged), y2=605 (below, shifts).
+    # `v`: y1=720 (above 700), y2=605 (below): the path spans 700.
     page.Contents = pdf.make_stream(b"100 600 m 110 720 130 605 v S\n")
 
     delta_y = 25.0
@@ -352,6 +345,5 @@ def test_shift_v_y_partial_only_below_y_shifted(tmp_path: Path) -> None:
     assert len(v_ops) == 1
     operands = v_ops[0].operands if hasattr(v_ops[0], "operands") else v_ops[0][0]
     ys = [float(operands[j]) for j in (1, 3)]
-    # 720 stays, 605 -> 580.
-    assert ys == [720.0, 580.0]
+    assert ys == [720.0, 605.0]
     pdf.close()

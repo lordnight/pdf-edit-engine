@@ -162,7 +162,7 @@ class ContentStreamInterpreter:
 
         # Path painting / termination
         if op in _PATH_PAINT_OPS:
-            self._emit_path(idx)
+            self._emit_path(idx, op)
             return
 
         # XObject invocation
@@ -473,7 +473,7 @@ class ContentStreamInterpreter:
                 ]
             )
 
-    def _emit_path(self, idx: int) -> None:
+    def _emit_path(self, idx: int, paint_operator: str) -> None:
         """Emit a path ContentElement from accumulated points."""
         if self._path_points:
             xs = [p[0] for p in self._path_points]
@@ -488,6 +488,7 @@ class ContentStreamInterpreter:
                 operator_range=(self._path_start_index, idx + 1),
                 bbox=bbox,
                 graphics_state=self._tracker.snapshot(),
+                paint_operator=paint_operator,
             )
         )
         self._path_points.clear()

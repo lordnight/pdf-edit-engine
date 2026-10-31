@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **Edits of RC4-encrypted PDFs land.** Every edit of an RC4 revision 2 or 3
+  input (for example an owner password with an empty user password) failed
+  with `ValueError: Cannot encrypt metadata when R < 4`, because the output
+  was re-encrypted with pikepdf's AES and encrypt-metadata defaults. The
+  output is now re-encrypted with the input's revision, cipher,
+  `/EncryptMetadata` and permissions, so an R 4 RC4 file and a file with
+  cleartext metadata are no longer rewritten as AES with encrypted
+  metadata. pikepdf cannot write R 4 RC4 with encrypted metadata, so that
+  one input is re-encrypted as R 4 AES-128. A `ValueError` from pikepdf on
+  re-encryption now falls back to an unencrypted save with an
+  `encryption_dropped` Degradation, like a `PdfError` already did.
+
 ## [0.2.0] — 2026-06-02
 
 Editing-depth release. v0.2.0 widens the set of PDFs the engine can edit

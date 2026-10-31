@@ -173,3 +173,28 @@ def build_unencrypted_pdf(out_path: Path | None = None) -> bytes:
     buf = io.BytesIO()
     pdf.save(buf, static_id=True)
     return emit_or_write(buf.getvalue(), out_path)
+
+
+def build_encrypted_pdf_with(
+    encryption: pikepdf.Encryption, *, linearize: bool = False, out_path: Path | None = None
+) -> bytes:
+    """Build the fixture encrypted with exactly ``encryption``.
+
+    Covers the schemes :func:`build_encrypted_pdf` does not (RC4 R 2 / 3 / 4,
+    AES-128 R 4, ``/EncryptMetadata false``, an empty user password beside an
+    owner password, restricted permissions) for the re-encryption mirror
+    probes.
+
+    Args:
+        encryption: The encryption to save with.
+        linearize: Save linearized ("Fast Web View") as well.
+        out_path: Optional destination; when given the bytes are written
+            there before being returned.
+
+    Returns:
+        The encrypted PDF bytes. Never ``None``.
+    """
+    pdf = _build_base_pdf()
+    buf = io.BytesIO()
+    pdf.save(buf, static_id=True, encryption=encryption, linearize=linearize)
+    return emit_or_write(buf.getvalue(), out_path)

@@ -58,6 +58,7 @@ import io
 from typing import TYPE_CHECKING
 
 import pikepdf
+import pytest
 
 from pdf_edit_engine import find, replace
 from pdf_edit_engine._pathutil import _save_pdf, open_pdf
@@ -67,13 +68,12 @@ from tests.corpus_builders.encrypted import (
     PASSWORD,
     REPLACEMENT,
     build_encrypted_pdf,
+    build_encrypted_pdf_with,
     build_unencrypted_pdf,
 )
 
 if TYPE_CHECKING:
     from pathlib import Path
-
-    import pytest
 
     from pdf_edit_engine.models import EditResult
 
@@ -434,3 +434,313 @@ def test_inv_w_5_delete_block_on_encrypted_preserves_encryption(tmp_path: Path) 
         )
     except pikepdf.PasswordError:
         pass
+
+
+_OWNER = "owner-pw"
+_RESTRICTED = pikepdf.Permissions(extract=False, modify_other=False, print_highres=False)
+
+
+def _scheme(path: Path, password: str) -> tuple[object, ...]:
+    """The encryption facts a round trip must keep: R, V, key bits, ciphers, metadata, /P."""
+    with pikepdf.open(str(path), password=password) as pdf:
+        info = pdf.encryption
+        encrypt_dict = pdf.trailer.Encrypt
+        return (
+            info.R,
+            info.V,
+            info.bits,
+            info.stream_method,
+            info.string_method,
+            encrypt_dict.get("/EncryptMetadata", True),
+            int(encrypt_dict.P),
+        )
+
+
+def _opens_without_password(path: Path) -> bool:
+    try:
+        pikepdf.open(str(path)).close()
+    except pikepdf.PasswordError:
+        return False
+    return True
+
+
+_RC4_CASES = [
+    pytest.param(2, "", id="R2-owner-only"),
+    pytest.param(2, "user-pw", id="R2-user-pw"),
+    pytest.param(3, "", id="R3-owner-only"),
+    pytest.param(3, "user-pw", id="R3-user-pw"),
+]
+
+
+def _build_rc4(tmp_path: Path, revision: int, user: str) -> Path:
+    inp = tmp_path / f"rc4_r{revision}_in.pdf"
+    inp.write_bytes(
+        build_encrypted_pdf_with(
+            pikepdf.Encryption(
+                owner=_OWNER,
+                user=user,
+                R=revision,  # type: ignore[arg-type]
+                allow=_RESTRICTED,
+                aes=False,
+                metadata=False,
+            )
+        )
+    )
+    return inp
+
+
+def _assert_round_tripped(inp: Path, out: Path, user: str) -> None:
+    assert _scheme(out, user) == _scheme(inp, user), (
+        "INV-W-5 violated: the edit changed the encryption scheme (R, V, bits, cipher, "
+        "/EncryptMetadata or /P)"
+    )
+    assert _opens_without_password(out) is _opens_without_password(inp), (
+        "INV-W-5 violated: the output's need for a password differs from the input's"
+    )
+
+
+@pytest.mark.parametrize(("revision", "user"), _RC4_CASES)
+def test_inv_w_5_rc4_input_round_trips_through_replace(
+    tmp_path: Path, revision: int, user: str
+) -> None:
+    """An RC4 R 2 / 3 input edited with ``replace`` keeps its encryption (it raised ValueError)."""
+    inp = _build_rc4(tmp_path, revision, user)
+    out = tmp_path / "rc4_out.pdf"
+
+    result = _edit_anchor(inp, out, password=user)
+
+    assert not isinstance(result, BaseException), (
+        f"replace failed on an RC4 R{revision} input: {type(result).__name__}: {result}"
+    )
+    assert result.success
+    assert not _has_encryption_dropped(result)
+    assert find(str(out), REPLACEMENT, password=user), "the replacement did not land"
+    _assert_round_tripped(inp, out, user)
+
+
+@pytest.mark.parametrize(("revision", "user"), _RC4_CASES)
+def test_inv_w_5_rc4_input_round_trips_through_replace_block(
+    tmp_path: Path, revision: int, user: str
+) -> None:
+    """An RC4 R 2 / 3 input edited with ``replace_block`` keeps its encryption."""
+    from pdf_edit_engine import replace_block
+
+    inp = _build_rc4(tmp_path, revision, user)
+    out = tmp_path / "rc4_block_out.pdf"
+    match = find(str(inp), FIND_ANCHOR, password=user)[0]
+
+    result = replace_block(
+        str(inp), match.page_number, match.bounding_box, REPLACEMENT, str(out), password=user
+    )
+
+    assert result.success
+    assert not _has_encryption_dropped(result)
+    assert find(str(out), REPLACEMENT, password=user), "the replacement did not land"
+    _assert_round_tripped(inp, out, user)
+
+
+@pytest.mark.parametrize("revision", [2, 3])
+def test_inv_w_5_rc4_owner_only_input_round_trips_through_add_watermark(
+    tmp_path: Path, revision: int
+) -> None:
+    """``add_watermark`` (no password kwarg) keeps an owner-password-only RC4 input's encryption."""
+    from pdf_edit_engine import add_watermark
+
+    inp = _build_rc4(tmp_path, revision, "")
+    mark = tmp_path / "mark.pdf"
+    mark.write_bytes(build_unencrypted_pdf())
+    out = tmp_path / "rc4_mark_out.pdf"
+
+    add_watermark(str(inp), str(mark), str(out))
+
+    with pikepdf.open(str(out)) as pdf:
+        assert pdf.is_encrypted
+        assert len(pdf.pages[0].Resources.XObject) == 1, "the watermark did not land"
+    _assert_round_tripped(inp, out, "")
+
+
+@pytest.mark.parametrize(
+    "encryption",
+    [
+        pytest.param(
+            pikepdf.Encryption(owner=PASSWORD, user=PASSWORD, R=4, aes=False, metadata=False),
+            id="R4-rc4-cleartext-metadata",
+        ),
+        pytest.param(
+            pikepdf.Encryption(owner=PASSWORD, user=PASSWORD, R=4, allow=_RESTRICTED),
+            id="R4-aes",
+        ),
+        pytest.param(
+            pikepdf.Encryption(owner=PASSWORD, user=PASSWORD, R=4, metadata=False),
+            id="R4-aes-cleartext-metadata",
+        ),
+        pytest.param(
+            pikepdf.Encryption(owner=PASSWORD, user=PASSWORD, R=6, allow=_RESTRICTED),
+            id="R6",
+        ),
+        pytest.param(
+            pikepdf.Encryption(owner=PASSWORD, user=PASSWORD, R=6, metadata=False),
+            id="R6-cleartext-metadata",
+        ),
+        pytest.param(
+            pikepdf.Encryption(owner=PASSWORD, user=PASSWORD, R=5),
+            id="R5",
+            marks=pytest.mark.filterwarnings("ignore:Encryption R=5 is deprecated"),
+        ),
+    ],
+)
+def test_inv_w_5_aes_capable_input_round_trips_unchanged(
+    tmp_path: Path, encryption: pikepdf.Encryption
+) -> None:
+    """R 4, 5 and 6 inputs keep their cipher and ``/EncryptMetadata`` across an edit."""
+    inp = tmp_path / "enc_in.pdf"
+    out = tmp_path / "enc_out.pdf"
+    inp.write_bytes(build_encrypted_pdf_with(encryption))
+
+    result = _edit_anchor(inp, out, password=PASSWORD)
+
+    assert not isinstance(result, BaseException), f"{type(result).__name__}: {result}"
+    assert result.success
+    assert not _has_encryption_dropped(result)
+    _assert_round_tripped(inp, out, PASSWORD)
+
+
+@pytest.mark.parametrize(
+    ("stream", "string", "encrypt_dict", "expected"),
+    [
+        pytest.param("rc4", "rc4", {}, (4, True, True), id="rc4-encrypted-metadata"),
+        pytest.param(
+            "aes",
+            "rc4",
+            {"/EncryptMetadata": False},
+            (4, True, False),
+            id="aes-streams-rc4-strings",
+        ),
+    ],
+)
+def test_inv_w_5_r4_scheme_pikepdf_cannot_write_is_rewritten_as_aes(
+    stream: str, string: str, encrypt_dict: dict[str, bool], expected: tuple[int, bool, bool]
+) -> None:
+    """R 4 RC4 with encrypted metadata, or RC4 beside AES, keeps R 4 and its metadata as AES."""
+    from types import SimpleNamespace
+
+    from pikepdf.models import EncryptionInfo, EncryptionMethod
+
+    from pdf_edit_engine._pathutil import _mirrored_encryption
+
+    stand_in = SimpleNamespace(
+        encryption=EncryptionInfo(
+            {
+                "R": 4,
+                "V": 4,
+                "P": -4,
+                "stream": EncryptionMethod[stream],
+                "string": EncryptionMethod[string],
+            }
+        ),
+        trailer=pikepdf.Dictionary(Encrypt=pikepdf.Dictionary(encrypt_dict)),
+        allow=_RESTRICTED,
+    )
+
+    encryption = _mirrored_encryption(stand_in, PASSWORD)  # type: ignore[arg-type]
+
+    assert (encryption.R, encryption.aes, encryption.metadata) == expected
+    assert encryption.allow == _RESTRICTED
+    with pikepdf.open(io.BytesIO(build_unencrypted_pdf())) as base:
+        base.save(io.BytesIO(), encryption=encryption)
+
+
+def test_inv_w_5_linearized_rc4_input_stays_linearized_and_encrypted(tmp_path: Path) -> None:
+    """A linearized R 3 input keeps both its Fast Web View layout and its encryption."""
+    inp = tmp_path / "lin_rc4_in.pdf"
+    out = tmp_path / "lin_rc4_out.pdf"
+    inp.write_bytes(
+        build_encrypted_pdf_with(
+            pikepdf.Encryption(owner=_OWNER, user="", R=3, aes=False, metadata=False),
+            linearize=True,
+        )
+    )
+
+    result = _edit_anchor(inp, out, password=None)
+
+    assert not isinstance(result, BaseException), f"{type(result).__name__}: {result}"
+    assert result.success
+    assert not _has_encryption_dropped(result)
+    with pikepdf.open(str(out)) as pdf:
+        assert pdf.is_linearized
+    _assert_round_tripped(inp, out, "")
+
+
+def _fail_encrypted_saves_with_value_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    original_save = pikepdf.Pdf.save
+
+    def failing_save(self: pikepdf.Pdf, *args: object, **kwargs: object) -> None:
+        if kwargs.get("encryption"):
+            raise ValueError("forced re-encryption failure (INV-W-5 probe)")
+        return original_save(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(pikepdf.Pdf, "save", failing_save)
+
+
+def test_inv_w_5_reencrypt_value_error_surfaces_encryption_dropped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``ValueError`` from pikepdf for the injected encryption lands the edit unencrypted."""
+    inp = tmp_path / "encrypted_in.pdf"
+    out = tmp_path / "encrypted_out.pdf"
+    inp.write_bytes(build_encrypted_pdf(PASSWORD))
+    _fail_encrypted_saves_with_value_error(monkeypatch)
+
+    result = _edit_anchor(inp, out, password=PASSWORD)
+
+    assert not isinstance(result, BaseException), f"{type(result).__name__}: {result}"
+    assert result.success
+    dropped = [d for d in result.fidelity_report.degradations if d.kind == "encryption_dropped"]
+    assert dropped, (
+        "INV-W-5 violated: a ValueError on re-encryption was not surfaced as "
+        f"encryption_dropped; got kinds={[d.kind for d in result.fidelity_report.degradations]}"
+    )
+    assert dropped[0].severity == "warning"
+    with pikepdf.open(str(out)) as pdf:
+        assert not pdf.is_encrypted
+
+
+def test_inv_w_5_linearized_reencrypt_value_error_keeps_linearization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``ValueError`` on a linearized encrypted save drops only the encryption."""
+    inp = tmp_path / "lin_in.pdf"
+    out = tmp_path / "lin_out.pdf"
+    inp.write_bytes(
+        build_encrypted_pdf_with(
+            pikepdf.Encryption(owner=PASSWORD, user=PASSWORD, R=6), linearize=True
+        )
+    )
+    _fail_encrypted_saves_with_value_error(monkeypatch)
+
+    result = _edit_anchor(inp, out, password=PASSWORD)
+
+    assert not isinstance(result, BaseException), f"{type(result).__name__}: {result}"
+    kinds = [d.kind for d in result.fidelity_report.degradations]
+    assert kinds.count("encryption_dropped") == 1, kinds
+    assert "linearization_dropped" not in kinds, kinds
+    with pikepdf.open(str(out)) as pdf:
+        assert not pdf.is_encrypted
+        assert pdf.is_linearized
+
+
+def test_inv_w_5_value_error_without_injected_encryption_propagates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Control: a ``ValueError`` on an unencrypted input's save is not swallowed."""
+    pdf = pikepdf.open(io.BytesIO(build_unencrypted_pdf()))
+
+    def failing_save(self: pikepdf.Pdf, *args: object, **kwargs: object) -> None:
+        raise ValueError("forced save failure (INV-W-5 control)")
+
+    monkeypatch.setattr(pikepdf.Pdf, "save", failing_save)
+    try:
+        with pytest.raises(ValueError, match="INV-W-5 control"):
+            _save_pdf(pdf, str(tmp_path / "out.pdf"), encryption_log=[])
+    finally:
+        pdf.close()

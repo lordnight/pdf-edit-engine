@@ -60,7 +60,7 @@ Identity-H CIDFont PDFs (Chrome, Google Docs, Word) may be slower due to CMap pa
 
 ## PDF compatibility
 
-- Encrypted PDFs require the password to open, but once it is provided they are edited and re-saved with their encryption preserved as of v0.2.0 (A2.3 — re-encrypted with the same algorithm and permissions; a genuine re-encryption failure falls back to an unencrypted save and surfaces an `encryption_dropped` Degradation)
+- Encrypted PDFs require the password to open, but once it is provided they are edited and re-saved with their encryption preserved as of v0.2.0 (A2.3 — re-encrypted with the same revision, cipher, `/EncryptMetadata` and permissions, RC4 R 2 and 3 included; the one exception is an R 4 RC4 file that encrypts its metadata, which pikepdf cannot write, so it is re-encrypted as R 4 AES-128 with its metadata still encrypted; a genuine re-encryption failure falls back to an unencrypted save and surfaces an `encryption_dropped` Degradation)
 - PDF/A compliance is not maintained after editing
 - Digital signatures are invalidated by any edit (inherent to how PDF signatures work)
 - Linearization (Fast Web View) is preserved on save as of v0.2.0 (A2.2 — a linearized input is re-linearized; on the rare case pikepdf cannot re-linearize, the edit still succeeds via a normal save and surfaces a `linearization_dropped` Degradation). A non-linearized input is unaffected

@@ -50,6 +50,36 @@ def _mat_mult(
     )
 
 
+def _mat_invert(
+    m: tuple[float, float, float, float, float, float],
+) -> tuple[float, float, float, float, float, float] | None:
+    """Invert an affine matrix represented as a 6-element tuple.
+
+    Args:
+        m: The matrix to invert.
+
+    Returns:
+        The inverse (``_mat_mult(m, inverse)`` is the identity), or ``None``
+        when the linear part is singular.
+    """
+    a, b, c, d, e, f = m
+    det = a * d - b * c
+    if det == 0.0:
+        return None
+    ia, ib, ic, id_ = d / det, -b / det, -c / det, a / det
+    return (ia, ib, ic, id_, -(e * ia + f * ic), -(e * ib + f * id_))
+
+
+def _transform_point(
+    m: tuple[float, float, float, float, float, float],
+    x: float,
+    y: float,
+) -> tuple[float, float]:
+    """Map the point ``(x, y)`` through an affine matrix (row-vector convention)."""
+    a, b, c, d, e, f = m
+    return (x * a + y * c + e, x * b + y * d + f)
+
+
 def _f(value: object) -> float:
     """Coerce a pikepdf operand to float."""
     return float(value)  # type: ignore[arg-type]

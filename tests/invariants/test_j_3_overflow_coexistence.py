@@ -74,9 +74,12 @@ def test_inv_j_3_j_5_overflow_coexistence(
     # the probe non-fragile, we accept either: (a) shift Degradation
     # present, or (b) reflow_aborted_to_simple present (shows reflow
     # was tried), or (c) the result was a simple-only path (no
-    # reflow_applied) — in which case only INV-J-3 applies.
+    # reflow_applied) — in which case only INV-J-3 applies. On the reflow
+    # path a shift that fits on the page is neither clamped nor suppressed,
+    # so the typed kinds must mirror the "Overflow shift ..." warnings.
     if res.fidelity_report.reflow_applied:
-        assert any(k in overflow_kinds for k in deg_kinds), (
-            f"INV-J-5 (overflow on reflow path): expected one of "
-            f"{overflow_kinds} in degradations; got {deg_kinds!r}"
+        shift_warnings = [w for w in res.warnings if w.startswith("Overflow shift")]
+        assert bool(shift_warnings) == any(k in overflow_kinds for k in deg_kinds), (
+            f"INV-J-5 (overflow on reflow path): shift warnings {shift_warnings!r} "
+            f"must be mirrored by one of {overflow_kinds} in degradations; got {deg_kinds!r}"
         )

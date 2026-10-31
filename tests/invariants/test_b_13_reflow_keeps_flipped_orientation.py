@@ -2,12 +2,13 @@
 
 A Y-flipped page (``cm 1 0 0 -1 0 h``) draws upright text through a negative-d
 ``Tm``, and a font-size-in-Tm run carries its size in ``Tm`` under ``Tf 1``.
-Reflow must re-emit that orientation (upright 12pt glyphs whose lines run down
-the page in reading order) instead of flattening it to an identity ``Tm``
-(mirrored text) or refusing it as rotated (the v0.2.0 B.12 gate refused every
-non-identity ``Tm``). Text whose baseline is rotated, sheared or reversed on
-the page, through the ``Tm`` or the CTM, is still refused with
-``rotated_text_unsupported`` (INV-B-8).
+Reflow must re-emit that orientation (12pt glyphs, upright or mirrored as in
+the source, whose lines run down the page in reading order from the edited
+line's position) instead of flattening it to an identity ``Tm`` or refusing it
+as rotated (the v0.2.0 B.12 gate refused every non-identity ``Tm``), under any
+axis-aligned CTM: flipped, scaled or identity. Text whose baseline is rotated,
+sheared or reversed on the page, through the ``Tm`` or the CTM, is still
+refused with ``rotated_text_unsupported`` (INV-B-8).
 """
 
 from __future__ import annotations
@@ -18,12 +19,18 @@ from typing import TYPE_CHECKING
 import pytest
 
 from pdf_edit_engine import find, replace
+from pdf_edit_engine.reflow import _low_confidence_diagnostics, detect_paragraphs
 from tests._flipped_page_fixture import (
     FLIP_CTM,
+    FLIP_IDENTITY_TM,
     FLIP_NEGATIVE_D_TM,
+    FLIP_POSITIVE_D_TM,
     FLIP_UNIT_TM,
+    IDENTITY,
     IDENTITY_CTM,
     PAGE_FONT_SIZE,
+    PAGE_WIDTH,
+    SCALED_CTM,
     TM_SCALED,
     Orientation,
     build_page_pdf,
@@ -49,7 +56,14 @@ def _reflow(src: Path, out: Path) -> EditResult:
 
 @pytest.mark.parametrize(
     "orientation",
-    [FLIP_NEGATIVE_D_TM, FLIP_UNIT_TM, TM_SCALED],
+    [
+        FLIP_NEGATIVE_D_TM,
+        FLIP_UNIT_TM,
+        TM_SCALED,
+        FLIP_POSITIVE_D_TM,
+        FLIP_IDENTITY_TM,
+        SCALED_CTM,
+    ],
     ids=lambda o: o.name,
 )
 def test_reflow_keeps_orientation_and_reading_order(
@@ -73,8 +87,46 @@ def test_reflow_keeps_orientation_and_reading_order(
     assert lines[0].baseline == pytest.approx(_FIRST_BASELINE), (
         "the first reflowed line must stay where the edited line was"
     )
-    assert all(line.upright for line in lines), "reflowed glyphs must not be mirrored"
+    assert all(line.upright == orientation.upright for line in lines), (
+        "reflowed glyphs must keep the source orientation (upright stays upright, "
+        "a mirrored run stays mirrored)"
+    )
     assert {size for line in lines for size in line.sizes} == {round(PAGE_FONT_SIZE)}
+
+
+_WORDS = "Total: 100 units shipped to the main site office this week"
+
+
+def _word_by_word_line(orientation: Orientation) -> bytes:
+    """One line drawn a word per run, spaced by the engine's 0.6 em default glyph width."""
+    content = orientation.prologue()
+    x = 72.0
+    for word in _WORDS.split():
+        content += orientation.run(x, _FIRST_BASELINE, word)
+        x += (len(word) + 1) * 0.6 * PAGE_FONT_SIZE
+    return content
+
+
+@pytest.mark.parametrize(
+    "orientation", [FLIP_NEGATIVE_D_TM, TM_SCALED, SCALED_CTM], ids=lambda o: o.name
+)
+def test_paragraph_metrics_are_page_space_whatever_the_orientation(
+    orientation: Orientation, tmp_path: Path
+) -> None:
+    [expected] = detect_paragraphs(
+        str(build_page_pdf(tmp_path / "identity.pdf", _word_by_word_line(IDENTITY)))
+    )
+    [paragraph] = detect_paragraphs(
+        str(build_page_pdf(tmp_path / "in.pdf", _word_by_word_line(orientation)))
+    )
+
+    for name in ("left_margin", "first_line_y", "paragraph_width", "line_height"):
+        assert getattr(paragraph, name) == pytest.approx(getattr(expected, name)), (
+            f"{name} must be the page-space value an identity page gives"
+        )
+    assert _low_confidence_diagnostics(paragraph, PAGE_WIDTH) == pytest.approx(
+        _low_confidence_diagnostics(expected, PAGE_WIDTH)
+    ), "the S5 table-cluster signal must read the same page-space widths"
 
 
 _COS5 = math.cos(math.radians(5))

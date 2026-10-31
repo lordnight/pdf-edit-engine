@@ -632,9 +632,8 @@ class Paragraph:
     indent_style: Literal["first_line", "hanging", "flush"] = "flush"
     first_line_indent: float = 0.0
     hanging_indent: float = 0.0
-    # Text matrix of the paragraph's first run, captured at the start of its
-    # show-text operator; ``None`` when it is the identity. Reflow re-emits
-    # this orientation (e.g. the ``[fs 0 0 -fs]`` of a Y-flipped page) instead
-    # of a fresh identity ``Tm``.
+    # Linear part of the paragraph's first-run text matrix, captured at the
+    # start of its show-text operator; ``None`` when it is the identity.
+    # Reflow re-emits this orientation (e.g. the ``[fs 0 0 -fs]`` of a
+    # Y-flipped page) instead of a fresh identity ``Tm``.
     text_matrix_abcd: tuple[float, float, float, float] | None = None
-    text_matrix_ef: tuple[float, float] | None = None

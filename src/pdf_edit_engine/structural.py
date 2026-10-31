@@ -31,8 +31,10 @@ from pdf_edit_engine.reflow import (
     _build_replacement_ops,
     _expand_to_bt_et,
     _find_bt_et_blocks,
+    _text_to_page_linear,
     break_into_lines,
 )
+from pdf_edit_engine.state import _IDENTITY, _mat_invert, _mat_mult, _transform_point
 
 logger = logging.getLogger(__name__)
 
@@ -689,6 +691,106 @@ def _sync_annotations_in_bbox(
 # ── Core: shift content below ────────────────────────────────────────────
 
 
+_Matrix = tuple[float, float, float, float, float, float]
+
+
+def _ctms_before_ops(ops: _Ops) -> list[_Matrix]:
+    """Return the CTM in effect when each operator runs (``q``/``Q``/``cm`` tracked)."""
+    ctm: _Matrix = _IDENTITY
+    stack: list[_Matrix] = []
+    ctms: list[_Matrix] = []
+    for inst in ops:
+        ctms.append(ctm)
+        op_str = _get_op_str(inst)
+        if op_str == "q":
+            stack.append(ctm)
+        elif op_str == "Q":
+            if stack:
+                ctm = stack.pop()
+        elif op_str == "cm":
+            operands = _get_operands(inst)
+            if len(operands) >= 6:
+                cm = (
+                    float(operands[0]),
+                    float(operands[1]),
+                    float(operands[2]),
+                    float(operands[3]),
+                    float(operands[4]),
+                    float(operands[5]),
+                )
+                ctm = _mat_mult(cm, ctm)
+    return ctms
+
+
+def _page_down_delta(ctm: _Matrix, delta_y: float) -> tuple[float, float] | None:
+    """User-space displacement that moves a point ``delta_y`` DOWN the page under *ctm*.
+
+    ``None`` when *ctm* is singular (content drawn under it is invisible).
+    """
+    inverse = _mat_invert(ctm)
+    if inverse is None:
+        return None
+    return (-delta_y * inverse[2], -delta_y * inverse[3])
+
+
+def _point_moved_down(
+    operands: list[Any],
+    xi: int,
+    yi: int,
+    ctm: _Matrix,
+    y_threshold: float,
+    delta_y: float,
+) -> list[Any] | None:
+    """Move the point at operands ``[xi]``/``[yi]`` down the page if it lies below the threshold.
+
+    The point is in the user space of *ctm*; the threshold and the shift are
+    page space. Returns the new operand list, or ``None`` when the point is
+    not below *y_threshold* (or *ctm* is singular). An axis-aligned CTM only
+    rewrites the y operand.
+    """
+    x, y = float(operands[xi]), float(operands[yi])
+    if _transform_point(ctm, x, y)[1] >= y_threshold:
+        return None
+    delta = _page_down_delta(ctm, delta_y)
+    if delta is None:
+        return None
+    dx, dy = delta
+    new_operands = list(operands)
+    if dx != 0.0:
+        new_operands[xi] = pikepdf.Object.parse(str(x + dx).encode())
+    new_operands[yi] = pikepdf.Object.parse(str(y + dy).encode())
+    return new_operands
+
+
+def _page_y_extent(elem: ContentElement) -> tuple[float, float] | None:
+    """Page-space ``(bottom, top)`` of a located element, ``None`` if it draws nothing.
+
+    The locator's bbox mixes spaces (a path's is raw user space, a text run's
+    height uses the Tf size and assumes upright glyphs), so it cannot be
+    compared with page-space positions under a flipped or scaled CTM. Color
+    state changes carry an all-zero bbox and draw nothing; neither does a
+    path with no construction points.
+    """
+    ctm = elem.graphics_state.ctm
+    if elem.type == "text" and elem.characters:
+        _a, b, _c, d = _text_to_page_linear(elem)
+        ys = [
+            ch.page_y + advance * b + rise * (ch.font_size * d)
+            for ch in elem.characters
+            for advance in (0.0, ch.width)
+            for rise in (-0.25, 0.75)
+        ]
+        return (min(ys), max(ys))
+    if elem.type == "path" and elem.bbox != (0.0, 0.0, 0.0, 0.0):
+        x0, y0, x1, y1 = elem.bbox
+        ys = [_transform_point(ctm, x, y)[1] for x in (x0, x1) for y in (y0, y1)]
+        return (min(ys), max(ys))
+    if elem.type in ("image", "xobject"):
+        ys = [_transform_point(ctm, x, y)[1] for x in (0.0, 1.0) for y in (0.0, 1.0)]
+        return (min(ys), max(ys))
+    return None
+
+
 def _shift_content_below_inplace(
     pdf: pikepdf.Pdf,
     page_obj: pikepdf.Page,
@@ -700,17 +802,22 @@ def _shift_content_below_inplace(
 
     Modifies the content stream and annotations in-place.
 
-    Convention: positive delta_y shifts content DOWN (decreases y-values
-    in PDF coordinates where y=0 is page bottom).  Negative delta_y
-    shifts content UP (increases y-values, closing gaps).
+    Convention: positive delta_y shifts content DOWN the page (decreases
+    page-space y, where y=0 is the page bottom).  Negative delta_y shifts
+    content UP (increases y-values, closing gaps).
 
-    Internally: ``y_new = y_old - delta_y``
+    Both *y_threshold* and *delta_y* are PAGE space. Each operand point is
+    mapped through the CTM in effect at its operator before it is compared
+    with the threshold, and moved by the user-space displacement that
+    lands delta_y lower on the page — so a Y-flipped (``cm 1 0 0 -1 0 h``)
+    or scaled page moves down like an identity one. Under an identity CTM
+    this is ``y_new = y_old - delta_y``.
 
     Args:
         pdf: Open pikepdf.Pdf object.
         page_obj: Page to modify.
         page_num: 0-indexed page number (for element index).
-        y_threshold: Only elements with y < y_threshold are shifted.
+        y_threshold: Only elements whose page-space y is below it are shifted.
         delta_y: Shift amount.  Positive = down, negative = up.
 
     Returns:
@@ -720,13 +827,14 @@ def _shift_content_below_inplace(
         return []
 
     ops: _Ops = _parse_content_stream(page_obj, context="structural._shift_content_below_inplace")
+    ctms = _ctms_before_ops(ops)
 
     # ── Text: walk ops tracking BT/ET context ────────────────────────
     #
     # For each BT/ET block, find the FIRST positioning op (Tm or Td).
-    #   - Tm is absolute: if ty < y_threshold, shift it.
-    #   - First Td (no preceding Tm in block): ty is absolute (BT resets
-    #     text matrix to identity).  If ty < y_threshold, shift it.
+    #   - Tm is absolute: if its origin is below y_threshold, shift it.
+    #   - First Td (no preceding Tm in block): its operands are the origin
+    #     (BT resets the text matrix to identity).  If below, shift it.
     #   - Subsequent Td/TD: relative line spacing — do NOT modify.
     #     Shifting the first op cascades to all lines in the block.
     in_bt = False
@@ -747,77 +855,62 @@ def _shift_content_below_inplace(
         if in_bt and op_str == "Tm":
             operands = _get_operands(inst)
             if len(operands) >= 6:
-                ty = float(operands[5])
-                if ty < y_threshold:
-                    new_operands = list(operands)
-                    new_operands[5] = pikepdf.Object.parse(str(ty - delta_y).encode())
+                moved = _point_moved_down(operands, 4, 5, ctms[i], y_threshold, delta_y)
+                if moved is not None:
                     operator = inst.operator if hasattr(inst, "operator") else inst[1]
-                    ops[i] = (new_operands, operator)
+                    ops[i] = (moved, operator)
             seen_positioning_in_block = True
             continue
 
         if in_bt and op_str in ("Td", "TD") and not seen_positioning_in_block:
-            # First Td/TD in block with no preceding Tm — absolute y
+            # First Td/TD in block with no preceding Tm — absolute origin
             operands = _get_operands(inst)
             if len(operands) >= 2:
-                ty = float(operands[1])
-                if ty < y_threshold:
+                moved = _point_moved_down(operands, 0, 1, ctms[i], y_threshold, delta_y)
+                if moved is not None:
                     operator = inst.operator if hasattr(inst, "operator") else inst[1]
-                    ops[i] = (
-                        [operands[0], pikepdf.Object.parse(str(ty - delta_y).encode())],
-                        operator,
-                    )
+                    ops[i] = (moved, operator)
             seen_positioning_in_block = True
             continue
 
-    # ── Paths: shift y-coordinates directly ──────────────────────────
+    # ── Paths: shift coordinates directly ────────────────────────────
     for i in range(len(ops)):
         inst = ops[i]
         op_str = _get_op_str(inst)
         operands = _get_operands(inst)
         operator = inst.operator if hasattr(inst, "operator") else inst[1]
+        ctm = ctms[i]
 
         if op_str in ("m", "l") and len(operands) >= 2:
-            y_val = float(operands[1])
-            if y_val < y_threshold:
-                ops[i] = (
-                    [operands[0], pikepdf.Object.parse(str(y_val - delta_y).encode())],
-                    operator,
-                )
+            moved = _point_moved_down(operands, 0, 1, ctm, y_threshold, delta_y)
+            if moved is not None:
+                ops[i] = (moved, operator)
 
-        elif op_str == "c" and len(operands) >= 6:
-            # Check if any control point is below threshold
-            ys = [float(operands[j]) for j in (1, 3, 5)]
-            if any(y < y_threshold for y in ys):
-                new_operands = list(operands)
-                for yi in (1, 3, 5):
-                    val = float(operands[yi])
-                    if val < y_threshold:
-                        new_operands[yi] = pikepdf.Object.parse(str(val - delta_y).encode())
-                ops[i] = (new_operands, operator)
-
-        elif op_str in ("v", "y") and len(operands) >= 4:
-            ys = [float(operands[j]) for j in (1, 3)]
-            if any(y < y_threshold for y in ys):
-                new_operands = list(operands)
-                for yi in (1, 3):
-                    val = float(operands[yi])
-                    if val < y_threshold:
-                        new_operands[yi] = pikepdf.Object.parse(str(val - delta_y).encode())
+        elif op_str in ("c", "v", "y") and len(operands) >= (6 if op_str == "c" else 4):
+            # Shift each control point that lies below the threshold.
+            new_operands = list(operands)
+            changed = False
+            for pi in range(0, 6 if op_str == "c" else 4, 2):
+                moved = _point_moved_down(new_operands, pi, pi + 1, ctm, y_threshold, delta_y)
+                if moved is not None:
+                    new_operands = moved
+                    changed = True
+            if changed:
                 ops[i] = (new_operands, operator)
 
         elif op_str == "re" and len(operands) >= 4:
-            y_val = float(operands[1])
-            if y_val < y_threshold:
-                ops[i] = (
-                    [
-                        operands[0],
-                        pikepdf.Object.parse(str(y_val - delta_y).encode()),
-                        operands[2],
-                        operands[3],
-                    ],
-                    operator,
-                )
+            # A rectangle moves as a whole when its page-space bottom edge
+            # is below the threshold.
+            x, y = float(operands[0]), float(operands[1])
+            w, h = float(operands[2]), float(operands[3])
+            bottom = min(_transform_point(ctm, cx, cy)[1] for cx in (x, x + w) for cy in (y, y + h))
+            delta = _page_down_delta(ctm, delta_y)
+            if bottom < y_threshold and delta is not None:
+                new_operands = list(operands)
+                if delta[0] != 0.0:
+                    new_operands[0] = pikepdf.Object.parse(str(x + delta[0]).encode())
+                new_operands[1] = pikepdf.Object.parse(str(y + delta[1]).encode())
+                ops[i] = (new_operands, operator)
 
         elif op_str == "cm" and len(operands) >= 6:
             # Only shift cm if it precedes a Do (image placement).
@@ -832,10 +925,34 @@ def _shift_content_below_inplace(
                 if nop not in ("q", "Q", "gs"):
                     break
             if next_is_do:
-                ty = float(operands[5])
-                if ty < y_threshold:
+                # The XObject's unit square is placed by this cm on top of
+                # the enclosing CTM; it moves when its page-space bottom edge
+                # is below the threshold, by a displacement in the enclosing
+                # CTM's user space (where the cm translation lives).
+                placed = _mat_mult(
+                    (
+                        float(operands[0]),
+                        float(operands[1]),
+                        float(operands[2]),
+                        float(operands[3]),
+                        float(operands[4]),
+                        float(operands[5]),
+                    ),
+                    ctm,
+                )
+                bottom = min(
+                    _transform_point(placed, ux, uy)[1] for ux in (0.0, 1.0) for uy in (0.0, 1.0)
+                )
+                delta = _page_down_delta(ctm, delta_y)
+                if bottom < y_threshold and delta is not None:
                     new_operands = list(operands)
-                    new_operands[5] = pikepdf.Object.parse(str(ty - delta_y).encode())
+                    if delta[0] != 0.0:
+                        new_operands[4] = pikepdf.Object.parse(
+                            str(float(operands[4]) + delta[0]).encode()
+                        )
+                    new_operands[5] = pikepdf.Object.parse(
+                        str(float(operands[5]) + delta[1]).encode()
+                    )
                     ops[i] = (new_operands, operator)
 
     # Write back content stream
@@ -873,8 +990,9 @@ def _shift_content_below_inplace(
         # Re-parse to check final positions
         elements = _build_index(page_obj, page_num)
         for elem in elements:
-            if elem.bbox[1] < page_bottom:
-                overshoot = page_bottom - elem.bbox[1]
+            extent = _page_y_extent(elem)
+            if extent is not None and extent[0] < page_bottom:
+                overshoot = page_bottom - extent[0]
                 warnings.append(f"Content shifted below page boundary by {overshoot:.1f}pt")
                 break
     return warnings
@@ -1595,7 +1713,11 @@ def _replace_block_on_page(
         mediabox = page_obj.get("/MediaBox")
         if mediabox is not None:
             page_bottom = float(mediabox[1])
-            below_ys = [e.bbox[1] for e in elements if e.bbox[1] < bbox[1]]
+            below_ys = [
+                extent[0]
+                for extent in map(_page_y_extent, elements)
+                if extent is not None and extent[0] < bbox[1]
+            ]
             if below_ys:
                 lowest_y = min(below_ys)
                 max_safe_shift = lowest_y - page_bottom

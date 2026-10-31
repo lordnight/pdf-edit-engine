@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import re
 from collections import Counter
 from pathlib import Path
@@ -34,7 +35,7 @@ from pdf_edit_engine.models import (
     Paragraph,
     TextMatch,
 )
-from pdf_edit_engine.state import _mat_mult
+from pdf_edit_engine.state import _IDENTITY, _mat_invert, _mat_mult, _transform_point
 from pdf_edit_engine.widths import (
     DEFAULT_WIDTH,
     parse_cid_widths,
@@ -352,6 +353,37 @@ def _group_elements_into_lines(
     return lines
 
 
+def _text_to_page_linear(element: ContentElement) -> tuple[float, float, float, float]:
+    """Return the linear part of ``Tm x CTM`` for a text element.
+
+    That is the run's text space as drawn on the page: ``(a, b)`` is a
+    text-space unit along the baseline, ``(c, d)`` one across it.
+    """
+    tm = element.graphics_state.text_matrix or _IDENTITY
+    a, b, c, d = _mat_mult((tm[0], tm[1], tm[2], tm[3], 0.0, 0.0), element.graphics_state.ctm)[:4]
+    return (a, b, c, d)
+
+
+def _page_scales(element: ContentElement) -> tuple[float, float]:
+    """Page-space length of a text-space unit along a run's baseline and across it."""
+    a, b, c, d = _text_to_page_linear(element)
+    return (math.hypot(a, b), math.hypot(c, d))
+
+
+def _page_right_edge(element: ContentElement) -> float:
+    """Page-space right edge of a text element's glyphs.
+
+    The locator's bbox adds text-space glyph widths to page-space positions,
+    so its x1 is short by the run's x-scale on a font-size-in-Tm or scaled
+    page; it is exact on an identity page.
+    """
+    x_scale = _page_scales(element)[0]
+    return max(
+        (ch.page_x + ch.width * x_scale for ch in element.characters or []),
+        default=element.bbox[2],
+    )
+
+
 def _build_paragraph(
     elements: list[ContentElement],
 ) -> Paragraph:
@@ -389,8 +421,8 @@ def _build_paragraph(
     if indent_style == "hanging":
         left_margin = x_starts[0]
 
-    # Right margin: rightmost extent of any element
-    right_margin = max(e.bbox[2] for e in elements)
+    # Right margin: rightmost page-space extent of any element
+    right_margin = max(_page_right_edge(e) for e in elements)
 
     # E.2 geometry safety (INV-G-7): wrap to the NARROWEST available width so
     # the widest-STARTING line still fits within the source right margin.
@@ -414,12 +446,9 @@ def _build_paragraph(
     # (a, b, c, d) is re-emitted by reflow so the paragraph keeps its
     # orientation: a Y-flip CTM (``cm 1 0 0 -1 0 h``) is paired with a
     # negative-d Tm, and flattening that to identity renders the text
-    # mirrored. Font-size-in-Tm PDFs (``Tf 1`` + ``Tm [fs 0 0 ±fs ...]``)
-    # carry the visual size in |a|, so the text-space line-height rungs below
-    # are scaled by it.
+    # mirrored.
     tm = elements[0].graphics_state.text_matrix
     text_matrix_abcd: tuple[float, float, float, float] | None = None
-    text_matrix_ef: tuple[float, float] | None = None
     if tm is not None:
         a, b, c, d = tm[0], tm[1], tm[2], tm[3]
         is_identity = (
@@ -427,8 +456,12 @@ def _build_paragraph(
         )
         if not is_identity:
             text_matrix_abcd = (a, b, c, d)
-            text_matrix_ef = (tm[4], tm[5])
-    tm_scale = abs(text_matrix_abcd[0]) if text_matrix_abcd else 1.0
+    # line_height is a PAGE-space advance (the overflow shift moves content
+    # below by it). The measured y-gap rung already is; the declared-leading
+    # and font-size rungs are text-space, so they are scaled by the run's
+    # text-to-page y-scale (|d| of a ``Tf 1`` + ``Tm [fs 0 0 ±fs ...]`` run,
+    # the CTM scale of a scaled page).
+    y_scale = _page_scales(elements[0])[1]
 
     # Line height precedence ladder (E.3 declared-leading rung first):
     #
@@ -444,7 +477,7 @@ def _build_paragraph(
     declared_leading = elements[0].graphics_state.leading
     declared_authoritative = elements[0].graphics_state.leading_authoritative
     if declared_authoritative and declared_leading is not None and declared_leading > 0:
-        line_height = declared_leading * tm_scale
+        line_height = declared_leading * y_scale
     elif len(lines) > 1:
         y_positions = [
             line[0].characters[0].page_y  # type: ignore[index]
@@ -455,10 +488,10 @@ def _build_paragraph(
         line_height = (
             sum(positive_gaps) / len(positive_gaps)
             if positive_gaps
-            else font_size * 1.2 * tm_scale
+            else font_size * 1.2 * y_scale
         )
     else:
-        line_height = font_size * 1.2 * tm_scale
+        line_height = font_size * 1.2 * y_scale
 
     # Full text: join elements using position-aware spacing so that
     # adjacent elements (gap < half a space width) are joined without
@@ -516,7 +549,6 @@ def _build_paragraph(
         first_line_indent=first_line_indent,
         hanging_indent=hanging_indent,
         text_matrix_abcd=text_matrix_abcd,
-        text_matrix_ef=text_matrix_ef,
     )
 
 
@@ -549,7 +581,7 @@ def _low_confidence_diagnostics(
     lines: dict[int, float] = {}
     for e in paragraph.elements:
         y_bucket = round(e.bbox[1] / Y_BUCKET) * int(Y_BUCKET)
-        line_w = e.bbox[2] - e.bbox[0]
+        line_w = _page_right_edge(e) - e.bbox[0]
         lines[y_bucket] = lines.get(y_bucket, 0.0) + line_w
     s2 = sum(w / paragraph.paragraph_width for w in lines.values()) / len(lines) if lines else 1.0
 
@@ -1109,15 +1141,18 @@ def _build_replacement_ops(
     hanging_indent: float = 0.0,
     observed: list[str] | None = None,
     text_matrix_abcd: tuple[float, float, float, float] | None = None,
-    text_matrix_ef: tuple[float, float] | None = None,
+    ctm: tuple[float, float, float, float, float, float] | None = None,
 ) -> list[tuple[list[Any], Any]]:
     """Build replacement content stream operators for a reflowed paragraph.
 
     Constructs a single BT/ET block with Tf, color, and positioning/text
     per line.  For CIDFonts, uses Tm (text matrix) for first-line
-    positioning and TJ arrays with per-glyph strings. A non-identity
-    source text matrix (*text_matrix_abcd*) is re-emitted on an absolute
-    ``Tm`` for every line instead.
+    positioning and TJ arrays with per-glyph strings. When the source text
+    matrix or the CTM is not the identity, every line is positioned by an
+    absolute ``Tm`` instead (see *text_matrix_abcd* and *ctm*).
+
+    ``left_margin``, ``first_line_y``, ``line_height`` and the palette x
+    positions are PAGE-space values; lines advance down the page.
 
     When *style_palette* is provided, per-line style preservation is applied:
 
@@ -1171,13 +1206,18 @@ def _build_replacement_ops(
             caller (``reflow_paragraph``) can surface a ``ligature_substituted``
             Degradation. None on call sites that omit it.
         text_matrix_abcd: Linear part of the source run's text matrix, or
-            None for the identity. When set, every line is positioned by an
-            absolute ``Tm`` carrying this orientation.
-        text_matrix_ef: The source run's ``Tm`` translation (text-space
-            origin of line 0); later lines are placed relative to it.
+            None for the identity. Re-emitted on every line's ``Tm`` so a
+            flipped or scaled run keeps its orientation and size.
+        ctm: The CTM in effect where the block is inserted, or None for the
+            identity. Each line's page-space origin is mapped through its
+            inverse into the ``Tm`` translation, so lines land at the same
+            page positions under a flipped, scaled or translated CTM.
 
     Returns:
         List of (operands, operator) tuples for the replacement block.
+
+    Raises:
+        ReflowError: If the CTM is singular, so no line can be placed.
     """
     extra = extra_resolvers or {}
     body_font_ref = pikepdf.Name("/" + font_name)
@@ -1258,18 +1298,21 @@ def _build_replacement_ops(
         line0_x = left_margin
         continuation_x = left_margin
 
-    # A non-identity source text matrix is re-emitted on an absolute Tm per
-    # line (a relative Td would be scaled by the matrix). Line 0 sits at the
-    # captured Tm origin and later lines are offset from it, stepping toward
-    # +y when d is negative (the Y-flip CTM pairing).
-    use_tm = text_matrix_abcd is not None
+    # Under a non-identity text matrix or CTM, page-space positions cannot be
+    # written as Td operands (Td is scaled by the matrix and the CTM moves the
+    # origin). Every line then gets an absolute Tm: the source (a, b, c, d) so
+    # the glyphs keep their orientation, and a translation that maps the
+    # line's page-space origin back through the inverse CTM.
+    page_ctm = ctm or _IDENTITY
+    use_tm = text_matrix_abcd is not None or page_ctm != _IDENTITY
     tm_a, tm_b, tm_c, tm_d = text_matrix_abcd or (1.0, 0.0, 0.0, 1.0)
-    tm_e, tm_f = text_matrix_ef or (line0_x, first_line_y)
-    y_step_sign = -1.0 if tm_d >= 0 else 1.0
+    page_to_user = _mat_invert(page_ctm)
+    if page_to_user is None:
+        msg = "Cannot reflow under a singular CTM"
+        raise ReflowError(msg)
 
     def _line_tm(x: float, line_idx: int) -> tuple[list[Any], Any]:
-        e = tm_e + (x - line0_x)
-        f = tm_f + y_step_sign * line_idx * line_height
+        e, f = _transform_point(page_to_user, x, first_line_y - line_idx * line_height)
         return ([tm_a, tm_b, tm_c, tm_d, e, f], pikepdf.Operator("Tm"))
 
     if use_tm:
@@ -1466,12 +1509,11 @@ def _baseline_is_page_horizontal(
     """True iff text runs left-to-right along the page x-axis, unrotated and unsheared.
 
     Pure function over the linear part of ``Tm x CTM`` (text space as drawn on
-    the page).
-    Scaling either axis and flipping the y-axis keep reflow's line layout
-    well-defined; rotation, shear, a reversed (mirrored or 180deg) baseline
-    and a degenerate axis do not. The shear terms are compared relative to
-    the axis scale so a ``Tf 1`` + ``Tm [12 0 0 12 ...]`` run and a 12pt
-    identity run are judged alike.
+    the page). Scaling either axis and flipping the y-axis keep reflow's line
+    layout well-defined; rotation, shear, a reversed (mirrored or 180deg)
+    baseline and a degenerate axis do not. The shear terms are compared
+    relative to the axis scale so a ``Tf 1`` + ``Tm [12 0 0 12 ...]`` run and a
+    12pt identity run are judged alike.
     """
     return a > 0 and d != 0 and abs(b) <= eps * a and abs(c) <= eps * abs(d)
 
@@ -1625,15 +1667,17 @@ def reflow_paragraph(
         )
 
     # 2. Break into lines (re-wraps the continuous text to paragraph width).
-    # paragraph_width is measured on the page, so a font-size-in-Tm run
-    # (``Tf 1`` + ``Tm [fs 0 0 ±fs ...]``) is measured at Tf size x |a|.
-    tm_scale = abs(paragraph.text_matrix_abcd[0]) if paragraph.text_matrix_abcd else 1.0
+    # paragraph_width is measured on the page, so words are measured at the
+    # page-space font size: the Tf size times the run's text-to-page x-scale
+    # (|a| of a ``Tf 1`` + ``Tm [fs 0 0 ±fs ...]`` run, the CTM scale of a
+    # scaled page).
+    x_scale = _page_scales(paragraph.elements[0])[0]
     lines = break_into_lines(
         new_para_text,
         paragraph.paragraph_width,
         font_resolver,
         font_ref,
-        paragraph.font_size * tm_scale,
+        paragraph.font_size * x_scale,
     )
 
     # E.4 (v0.2.0): widow/orphan honesty surfacing. Evaluated on the wrapped
@@ -1829,16 +1873,23 @@ def reflow_paragraph(
         # Import locally to avoid cross-module boundary noise at import
         # time. structural owns the shift primitive; we borrow it.
         from pdf_edit_engine.locator import _build_index as _reflow_build_index
-        from pdf_edit_engine.structural import _shift_content_below_inplace
+        from pdf_edit_engine.structural import _page_y_extent, _shift_content_below_inplace
 
+        # Everything here is PAGE space (y up from the MediaBox bottom), the
+        # space the shift primitive and the clamp work in: line_height is a
+        # page-space advance, and the glyph box hangs below the last baseline
+        # by its page-space descent (0.25 em for upright text, 0.75 em for a
+        # vertically mirrored run).
         requested_shift = extra_lines * paragraph.line_height
         shift_amount = requested_shift
+        page_em = paragraph.font_size * _text_to_page_linear(paragraph.elements[0])[3]
+        glyph_descent = -min(-0.25 * page_em, 0.75 * page_em)
         # y_threshold is the bottom edge of the paragraph; everything
         # below that is shifted.
         paragraph_bottom_y = (
             paragraph.first_line_y
             - (paragraph.line_count - 1) * paragraph.line_height
-            - (paragraph.font_size * 0.25)
+            - glyph_descent
         )
         # Page-bottom clamp — mirrors structural._replace_block_on_page so
         # an overflow that would push content below MediaBox[1] is either
@@ -1848,13 +1899,17 @@ def reflow_paragraph(
         mediabox = page.get("/MediaBox")
         if mediabox is not None:
             page_bottom = float(mediabox[1])
-            elements_below = [
-                e
-                for e in _reflow_build_index(page, paragraph.elements[0].page)
-                if e.bbox[1] < paragraph_bottom_y
-            ]
-            if elements_below:
-                lowest_y = min(e.bbox[1] for e in elements_below)
+            # Bottoms of everything that draws below the paragraph, in page
+            # space. Elements that draw nothing (color state changes and empty
+            # paths, whose bbox is all zeros) must not count, or such a page
+            # reads as "content at y=0" and the shift is suppressed.
+            below_bottoms: list[float] = []
+            for e in _reflow_build_index(page, paragraph.elements[0].page):
+                extent = _page_y_extent(e)
+                if extent is not None and extent[0] < paragraph_bottom_y:
+                    below_bottoms.append(extent[0])
+            if below_bottoms:
+                lowest_y = min(below_bottoms)
                 max_safe_shift = lowest_y - page_bottom
                 if max_safe_shift <= 0:
                     shift_warnings.append(
@@ -1933,6 +1988,9 @@ def reflow_paragraph(
     # ligature CID via the observed out-param so the loss is surfaced honestly.
     style_degradations: list[Degradation] = []
     ligature_observed: list[str] = []
+    # The rebuilt block is spliced in where the paragraph's first operator (in
+    # content-stream order) was, so that operator's CTM governs its lines.
+    insertion_ctm = min(paragraph.elements, key=lambda e: e.operator_range[0]).graphics_state.ctm
     replacement = _build_replacement_ops(
         lines=lines,
         font_name=paragraph.font_name,
@@ -1950,7 +2008,7 @@ def reflow_paragraph(
         hanging_indent=paragraph.hanging_indent,
         observed=ligature_observed,
         text_matrix_abcd=paragraph.text_matrix_abcd,
-        text_matrix_ef=paragraph.text_matrix_ef,
+        ctm=insertion_ctm,
     )
 
     # B.9 (INV-B-9): surface a ligature_substituted info Degradation when a

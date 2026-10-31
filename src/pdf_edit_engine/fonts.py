@@ -255,7 +255,30 @@ def _symbol_cmap_has_codepoint(
     return False
 
 
-def _load_cff_as_ttfont(font_bytes: bytes) -> tuple[TTFont, bool]:
+def _collection_face_number(source: str | io.BytesIO, postscript_name: str | None) -> int:
+    """Index of the face of a TrueType Collection whose PostScript name matches.
+
+    A collection holds a family's faces (Helvetica.ttc: Regular, Bold,
+    Oblique, ...; NotoSansCJK-Regular.ttc: one face per region), so the donor
+    must be the face the font was resolved by, not the first one. Falls back
+    to face 0 when no face carries *postscript_name* (or none is given).
+    """
+    if postscript_name:
+        from fontTools.ttLib.ttCollection import TTCollection  # type: ignore[import-untyped]
+
+        collection = TTCollection(source, lazy=True)
+        try:
+            for index, face in enumerate(collection.fonts):
+                if face["name"].getDebugName(6) == postscript_name:
+                    return index
+        finally:
+            collection.close()
+    return 0
+
+
+def _load_cff_as_ttfont(
+    font_bytes: bytes, postscript_name: str | None = None
+) -> tuple[TTFont, bool]:
     """Load a CFF ``/FontFile3`` binary as a ``TTFont``, wrapping bare CFF.
 
     A ``/FontFile3 /Type1C`` is a BARE CFF table (raw Type1C program, no
@@ -265,10 +288,11 @@ def _load_cff_as_ttfont(font_bytes: bytes) -> tuple[TTFont, bool]:
     can read ``["head"]`` / ``["hmtx"]`` / ``["maxp"]`` uniformly — the bare
     case is wrapped into a minimal in-memory sfnt via ``cffLib`` +
     ``FontBuilder``. A ``ttcf`` collection (a ``.ttc`` system donor) loads
-    its first face.
+    the face named *postscript_name* (its first face when none matches).
 
     Args:
         font_bytes: The raw ``/FontFile3`` payload (bare CFF or full sfnt).
+        postscript_name: PostScript name of the face to load from a collection.
 
     Returns:
         A ``(ttfont, was_bare)`` tuple. ``was_bare`` is True when the input
@@ -282,7 +306,8 @@ def _load_cff_as_ttfont(font_bytes: bytes) -> tuple[TTFont, bool]:
             ``_with_fonttools_translation`` block).
     """
     if font_bytes[:4] == b"ttcf":
-        return TTFont(io.BytesIO(font_bytes), fontNumber=0), False
+        face_number = _collection_face_number(io.BytesIO(font_bytes), postscript_name)
+        return TTFont(io.BytesIO(font_bytes), fontNumber=face_number), False
     if font_bytes[:4] in _SFNT_MAGICS:
         return TTFont(io.BytesIO(font_bytes)), False
 
@@ -327,14 +352,14 @@ def _load_cff_as_ttfont(font_bytes: bytes) -> tuple[TTFont, bool]:
     return builder.font, True
 
 
-def _open_system_ttfont(system_path: str) -> TTFont:
-    """Open a system donor font file, taking the first face of a ``.ttc``.
+def _open_system_ttfont(system_path: str, postscript_name: str | None = None) -> TTFont:
+    """Open a system donor font file, taking the face named *postscript_name* of a ``.ttc``.
 
     fontTools refuses a TrueType Collection without ``fontNumber``, and macOS
     ships most system fonts (Helvetica, Times, ...) as ``.ttc``.
     """
     if system_path.lower().endswith(".ttc"):
-        return TTFont(system_path, fontNumber=0)
+        return TTFont(system_path, fontNumber=_collection_face_number(system_path, postscript_name))
     return TTFont(system_path)
 
 
@@ -1970,6 +1995,7 @@ def _extend_tier2(
             fd,
             additional_chars,
             system_path,
+            donor_name=substituted_name or ps_name,
             substitution_log=substitution_log,
             degradations=degradations,
         )
@@ -1983,7 +2009,7 @@ def _extend_tier2(
     embedded_bytes, _ = _extract_font_bytes(fd)
     with _with_fonttools_translation(f"_extend_tier2:{ps_name}"):
         embedded = TTFont(io.BytesIO(embedded_bytes))
-        system = _open_system_ttfont(system_path)
+        system = _open_system_ttfont(system_path, substituted_name or ps_name)
         try:
             units_per_em = embedded["head"].unitsPerEm
             new_cmap_entries: dict[int, str] = {}
@@ -2064,6 +2090,7 @@ def _extend_cff_tier(
     additional_chars: str,
     system_path: str,
     *,
+    donor_name: str | None = None,
     substitution_log: list[str] | None,
     degradations: list[Degradation] | None,
 ) -> str:
@@ -2093,6 +2120,8 @@ def _extend_cff_tier(
         fd: The FontDescriptor dictionary (owns ``/FontFile3``).
         additional_chars: Unicode characters to inject.
         system_path: Resolved donor CFF font path.
+        donor_name: PostScript name the donor was resolved by, which picks
+            the face of a ``.ttc`` donor.
         substitution_log: Unused for the donor name here (the donor is the
             resolved ``system_path``); present for signature symmetry with the
             glyf body. The metric-equivalent name was already appended by
@@ -2115,7 +2144,7 @@ def _extend_cff_tier(
 
     with _with_fonttools_translation("_extend_cff_tier"):
         embedded, was_bare = _load_cff_as_ttfont(embedded_bytes)
-        donor, _donor_bare = _load_cff_as_ttfont(donor_bytes)
+        donor, _donor_bare = _load_cff_as_ttfont(donor_bytes, donor_name)
         try:
             units_per_em = embedded["head"].unitsPerEm
             new_cmap_entries: dict[int, str] = {}
@@ -2365,7 +2394,7 @@ def _extend_simple_tier_one_five(
         embedded = TTFont(
             io.BytesIO(read_stream_bounded(ff2, max_decoded=MAX_FONT_STREAM_BYTES, label="font"))
         )
-        system = _open_system_ttfont(system_path)
+        system = _open_system_ttfont(system_path, substituted_name or ps_name)
         try:
             # 6. Inject glyphs for both groups; collect (byte, glyph_name, width).
             # _glyph_width_from_hmtx raises FontNotFoundError on missing

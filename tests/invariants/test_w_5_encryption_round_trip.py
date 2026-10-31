@@ -898,6 +898,29 @@ def test_inv_w_5_value_error_without_injected_encryption_propagates(
         pdf.close()
 
 
+def test_inv_w_5_encrypt_pdf_save_failure_raises_without_plaintext_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``encrypt_pdf``'s own encryption failing to save raises; no plaintext copy is written."""
+    from pdf_edit_engine import encrypt_pdf
+
+    inp = tmp_path / "plain_in.pdf"
+    out = tmp_path / "encrypted_out.pdf"
+    inp.write_bytes(build_unencrypted_pdf())
+    original_save = pikepdf.Pdf.save
+
+    def failing_save(self: pikepdf.Pdf, *args: object, **kwargs: object) -> None:
+        if kwargs.get("encryption"):
+            raise pikepdf.PdfError("forced encrypted-save failure (INV-W-5 probe)")
+        return original_save(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(pikepdf.Pdf, "save", failing_save)
+    with pytest.raises(PDFEditError):
+        encrypt_pdf(str(inp), _OWNER, _USER, str(out))
+
+    assert not out.exists(), "encrypt_pdf saved an unencrypted copy after its encrypted save failed"
+
+
 def test_inv_w_5_package_imports_without_the_pikepdf_10_9_encryption_method_export() -> None:
     """The package imports on pikepdf 10.0-10.8, before ``pikepdf.models`` exported it.
 

@@ -690,15 +690,43 @@ class TestTier1_5GlyphInjection:
         assert "Acme Corporation at top" in text, f"body text corrupted after injection: {text!r}"
 
     def test_glyph_width_cache_evict_public(self) -> None:
-        """GlyphWidthCache.evict drops cached widths for a single font."""
-        from pdf_edit_engine.widths import GlyphWidthCache
+        """GlyphWidthCache.evict drops cached widths for a single font.
 
-        cache = GlyphWidthCache()
-        cache._cache["F1"] = {5: 500.0}  # noqa: SLF001
-        assert "F1" in cache._cache  # noqa: SLF001
-        cache.evict("F1")
-        assert "F1" not in cache._cache  # noqa: SLF001
-        cache.evict("F99")  # no-op for missing key — must not raise
+        Post-INV-W-1 the cache keys on the font dict's objgen, so ``evict``
+        takes ``(page, font_name)`` and resolves the dict to compute the key.
+        """
+        from pdf_edit_engine.widths import GlyphWidthCache, width_cache_key
+
+        pdf = pikepdf.Pdf.new()
+        try:
+            font_dict = pdf.make_indirect(
+                pikepdf.Dictionary(
+                    {
+                        "/Type": pikepdf.Name("/Font"),
+                        "/Subtype": pikepdf.Name("/Type1"),
+                        "/BaseFont": pikepdf.Name("/Helvetica"),
+                        "/Encoding": pikepdf.Name("/WinAnsiEncoding"),
+                        "/FirstChar": 65,
+                        "/LastChar": 65,
+                        "/Widths": pikepdf.Array([500.0]),
+                    }
+                )
+            )
+            page = pdf.add_blank_page(page_size=(200, 200))
+            page["/Resources"] = pikepdf.Dictionary(
+                {"/Font": pikepdf.Dictionary({"/F1": font_dict})}
+            )
+
+            cache = GlyphWidthCache()
+            key = width_cache_key(font_dict, "F1")
+            cache._cache[key] = {65: 500.0}  # noqa: SLF001
+            assert key in cache._cache  # noqa: SLF001
+            cache.evict(page, "F1")
+            assert key not in cache._cache  # noqa: SLF001
+            # No-op for a name not in page resources — must not raise.
+            cache.evict(page, "F99")
+        finally:
+            pdf.close()
 
     def test_tier1_extension_dedup_cmap_entries(self, tmp_path: Path) -> None:
         """Repeat extend_subset must not duplicate CMap bfchar lines on disk.
@@ -730,6 +758,74 @@ class TestTier1_5GlyphInjection:
             assert size_2 == size_1, (
                 f"ToUnicode stream grew from {size_1} to {size_2} bytes "
                 f"on repeat call — duplicate bfchar lines appended"
+            )
+
+
+# ── TestFontFile2CacheEviction (IMP-1) ───────────────────────────────
+
+
+@_need_resume
+class TestFontFile2CacheEviction:
+    """regression guard: double-extension on the same font does not
+    produce spurious extra Degradations."""
+
+    def test_double_extension_different_codepoints(self, tmp_path: Path) -> None:
+        if find_font("Calibri-Bold") is None:
+            pytest.skip("Calibri-Bold not installed; cannot exercise Tier 1.5 path")
+
+        step1 = str(tmp_path / "step1.pdf")
+        step2 = str(tmp_path / "step2.pdf")
+
+        # Step 1: replace "Aryan" with "Aryanø" — Calibri-Bold subset
+        # lacks ø, so extend_subset runs and Tier 1.5 injects ø into
+        # /FontFile2.
+        r1_list = replace_all(str(RESUME), "Aryan", "Aryanø", step1)
+        assert r1_list, "step 1: no matches (corpus invariant broken)"
+        r1 = r1_list[0]
+        assert r1.success is True
+        assert r1.font_action == "extended"
+        r1_cov = [
+            d
+            for d in r1.fidelity_report.degradations
+            if d.kind in ("font_coverage_extended", "font_coverage_substituted")
+        ]
+        assert any("ø" in d.detail for d in r1_cov)
+
+        # Step 2: replace "Aryanø" with "Aryanü" — ü is also missing
+        # from the Calibri-Bold subset, so Tier 1.5 must run again as
+        # a fresh extension for ü. With cache eviction (the fix), any
+        # font_has_codepoint queries during step 2 read the current
+        # /FontFile2 freshly. Without eviction, in scenarios where the
+        # cache key is preserved, a stale read could spuriously report
+        # ø as missing and append a duplicate ø entry to step 2's
+        # degradations.
+        r2_list = replace_all(step1, "Aryanø", "Aryanü", step2)
+        assert r2_list, "step 2: no matches"
+        r2 = r2_list[0]
+        assert r2.success is True
+        # Step 2 must report a fresh extension event for ü:
+        assert r2.font_action == "extended"
+        r2_cov = [
+            d
+            for d in r2.fidelity_report.degradations
+            if d.kind in ("font_coverage_extended", "font_coverage_substituted")
+        ]
+        assert any("ü" in d.detail for d in r2_cov), (
+            "step 2 did not surface ü as a fresh extension; "
+            f"r2 degradations: {r2.fidelity_report.degradations!r}"
+        )
+        # Step 2 must NOT have an entry whose chars-list is just ø
+        # (would indicate a stale-cache leak from step 1).
+        # Detail format: "tier=N,chars=<csv>[,source=<name>]".
+        for d in r2_cov:
+            chars_part = next(
+                (p[len("chars=") :] for p in d.detail.split(",") if p.startswith("chars=")),
+                "",
+            )
+            assert chars_part != "ø", (
+                "step 2 has a stale ø-only coverage Degradation "
+                f"({d!r}) — font_has_codepoint may be misreading the "
+                "live /FontFile2 and leaking pre-step-1 state"
             )
 
     def test_resolver_cache_shared_font_cross_page_evict(self, tmp_path: Path) -> None:
@@ -774,3 +870,18 @@ class TestTier1_5GlyphInjection:
             assert r2_after is not r1, (
                 "evict on one page must clear entries for every page referencing the same font dict"
             )
+
+
+# NB: ARY-349 originally added two probes here for the _FONTFILE2_CACHE
+# repair on pikepdf >=10.5.1. Phase 13.4 probes (tests/test_simple_extension.py)
+# subsequently surfaced that the cache had two latent issues — populate-vs-evict
+# key mismatch (Dictionary copy stripped objgen) AND cross-Pdf id-recycling
+# pollution. The root fix was to delete the cache entirely (it had been a
+# no-op under pikepdf 10.5.1 anyway, so deletion has zero observable
+# performance regression). With the cache gone, both probes describe a
+# data structure that no longer exists; they were removed alongside the
+# cache. font_has_codepoint's correctness on pikepdf 10.5.1+ is now
+# covered by tests/test_simple_extension.py probe 1
+# (test_simple_tier_15_success_via_synthetic_fixture) and probe 5
+# (test_double_extension_no_byte_collision), which exercise the full
+# extension path end-to-end against the real /FontFile2 binary.

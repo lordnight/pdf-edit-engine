@@ -132,10 +132,32 @@ resolver together.
 
 ## Known limitations
 
-- **CFF / OpenType outlines are not supported.** `_inject_glyph_in_place`
-  at `fonts.py` raises `FontNotFoundError` when the embedded
-  font's `/FontFile3` carries Type1C charstrings rather than a `glyf`
-  table. Tracked in ARY-279 for v0.1.3.
+- **CID-keyed (Type0) CFF / Type1C injection IS supported (v0.2.0, C.3).**
+  A CID-keyed (`ROS`), single-FD, `glyf`-free CFF embedded as
+  `/FontFile3` (including a bare `/Type1C`) whose donor is a
+  non-composite CFF of matching `unitsPerEm` is injected in place by
+  `_inject_cff_glyph_in_place` — the Type2-charstring sibling of the
+  `glyf` Tier 1.5 `_inject_glyph_in_place`. The donor outline is drawn
+  into the embedded CFF context with a `T2CharStringPen` and appended
+  at a collision-free `CID == GID` at the additive tail; pre-existing
+  CIDs are never renumbered (INV-C-11/12/13).
+- **Other CFF shapes are not supported and refuse honestly.**
+  Outline-table classification (INV-C-9, C.1) drives the dispatch: the
+  pure `_classify_outline_table` at `fonts.py` sniffs the table the
+  embedded binary ACTUALLY carries (`glyf` / `CFF ` / `CFF2`), not the
+  `/FontFile2` vs `/FontFile3` slot; `classify_embedded_outline` maps it
+  to the truthful `embedded_type` and is the single source both
+  `_extract_font_bytes` and `locator._detect_embedded_type` route
+  through. `_extend_tier2` gates on this BEFORE any glyph surgery and
+  raises `FontNotFoundError` (in `_FONT_EXTEND_FAIL_EXCS`, so every
+  write path surfaces an honest `font_extension_failed` Degradation with
+  `success=False`, never a raw `KeyError('/FontFile2')`) for every shape
+  the C.3 slice does not cover: CFF2, name-keyed (non-`ROS`) CFF,
+  multi-FD CID, composite/seac donors, a TrueType donor for a CFF
+  target, and `unitsPerEm` mismatch. The simple-font path
+  (`_extend_simple_tier_one_five`) still rejects `/FontFile3`. CFF
+  outline-VALUE conversion (e.g. Separation tints), CFF2, multi-FD, and
+  composite donors remain deferred (ARY-279 follow-ups).
 - **Type 3 fonts (bitmap/procedural) are not supported** for extension.
 - **unitsPerEm mismatch** between the embedded and system font is
   treated as a hard failure (no rescaling).

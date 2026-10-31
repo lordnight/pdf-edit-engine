@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pikepdf
@@ -10,12 +11,25 @@ import pytest
 from pdf_edit_engine.errors import OperatorError, PDFEditError
 from pdf_edit_engine.locator import find, get_fonts, get_text
 from pdf_edit_engine.models import Edit, TextMatch
-from pdf_edit_engine.surgeon import batch_replace, replace, replace_all
+from pdf_edit_engine.surgeon import (
+    _kerning_decision,
+    batch_replace,
+    replace,
+    replace_all,
+)
 
 CORPUS_DIR = Path(__file__).parent / "corpus"
 RESUME_PDF = str(CORPUS_DIR / "Aryan_BV_Resume_2026.pdf")
 SIMPLE_PDF = str(CORPUS_DIR / "reportlab_simple.pdf")
 MULTIPAGE_PDF = str(CORPUS_DIR / "reportlab_multipage.pdf")
+
+# M-10: out-of-repo SOW fixture path. CI (and contributors without the
+# marketing fixture on disk) override via the M10_SOW_PDF env-var; the
+# default points at the original on-disk location so the launch-gate
+# author's local runs are unchanged. Mirrors the RESUME_PDF precedent
+# above. The skipif at the use-site keeps the test SKIPPED when the
+# resolved path is missing, so the default state in CI is unchanged.
+_M10_SOW = os.environ.get("M10_SOW_PDF", "C:/New Project/pdf-marketing/m10-launch/sow.pdf")
 
 _need_resume = pytest.mark.skipif(
     not Path(RESUME_PDF).exists(), reason="Aryan_BV_Resume_2026.pdf not in corpus"
@@ -152,6 +166,38 @@ class TestDifferentLengthReplace:
         assert result.success is True
         assert result.fidelity_report.overflow_detected is True
 
+    def test_overflow_emits_typed_degradation(self, tmp_path: Path) -> None:
+        """IMP-2: when overflow_detected flips True on the simple-
+        replacement path the surgeon emits a typed
+        ``overflow_shift_clamped`` Degradation (severity=warning)
+        alongside the warnings-list entry. Pre-fix the flag was set
+        but no typed Degradation was appended, so callers iterating
+        ``fidelity_report.degradations`` (the v0.1.3 surfacing layer)
+        could not distinguish "overflowed" from "clean replacement"
+        without falling back to the legacy warnings list.
+
+        Uses ``reflow=False`` to force the simple-replacement path.
+        With reflow enabled, a wider-than-original replacement routes
+        through ``reflow_paragraph`` which already emits its own typed
+        overflow Degradations (v0.1.3 Phase 6). The IMP-2 site is the
+        simple-replacement horizontal-overflow detection at the tail
+        of ``_apply_single_replacement``.
+        """
+        match = _first_match(SIMPLE_PDF, "Test")
+        out = str(tmp_path / "output.pdf")
+        result = replace(SIMPLE_PDF, match, "A" * 200, out, reflow=False)
+
+        assert result.success is True
+        assert result.fidelity_report.overflow_detected is True
+        assert any(
+            d.kind == "overflow_shift_clamped" and d.severity == "warning"
+            for d in result.fidelity_report.degradations
+        ), (
+            "IMP-2: overflow_detected=True must imply at least one "
+            "Degradation(kind='overflow_shift_clamped', severity='warning'); "
+            f"got {result.fidelity_report.degradations!r}"
+        )
+
 
 # ── Cross-element replacement ────────────────────────────────────────────
 
@@ -186,7 +232,28 @@ class TestEncodingFailure:
     """Test behavior when replacement text cannot be encoded."""
 
     def test_unencodable_returns_failure(self, tmp_path: Path) -> None:
-        """Replacing with characters not in font returns success=False."""
+        """Replacing with characters not in font returns success=False.
+
+        v0.1.3 (Phase 4): also asserts the lying-success-path fix \u2014
+        font_preserved must be False (was buggy True pre-v0.1.3) and
+        degradations must contain a font_extension_failed entry.
+
+        v0.1.3 Phase 13 note: this test exercises the **non-CID
+        extension's no-AGL-name failure path**. SIMPLE_PDF
+        (`reportlab_simple.pdf`) is a /TrueType + /WinAnsiEncoding font
+        which Phase 13's dispatcher routes to `_extend_simple_tier_one_five`
+        rather than rejecting at the `is_cid_font` gate (now dropped).
+        The replacement chars are CJK (U+4F60 \u4f60, U+597D \u597d),
+        which `_glyph_name_for_codepoint` resolves to `uni4F60` and
+        `uni597D` (no AGL entry exists for these codepoints). The
+        downstream `_inject_glyph_in_place` then fails to source these
+        glyphs from the system font (Carlito/Arial don't carry CJK
+        outlines), and the call surfaces as `font_extension_failed`
+        per `_FONT_EXTEND_FAIL_EXCS`. This is the v0.1.3 contract:
+        extension is *attempted* on simple TrueType fonts, but
+        legitimately fails when neither AGL nor system-font cmap covers
+        the codepoint.
+        """
         match = _first_match(SIMPLE_PDF, "Test")
         out = str(tmp_path / "output.pdf")
         result = replace(SIMPLE_PDF, match, "\u4f60\u597d", out)
@@ -194,6 +261,27 @@ class TestEncodingFailure:
         assert result.success is False
         assert result.font_action == "failed"
         assert len(result.fidelity_report.glyphs_missing) > 0
+
+        # v0.1.3 lying-success-path fix (design doc \u00a73 rows 2/3):
+        # font_preserved is now a computed @property \u2014 it must return
+        # False whenever a FONT_AFFECTING_KINDS Degradation was emitted.
+        # font_extension_failed is in FONT_AFFECTING_KINDS.
+        assert result.fidelity_report.font_preserved is False, (
+            "v0.1.3 INV-J-8 violated: font_preserved should be False on "
+            "force-failed extension; was True pre-v0.1.3 (architectural lie)."
+        )
+        kinds = [d.kind for d in result.fidelity_report.degradations]
+        assert "font_extension_failed" in kinds, (
+            f"v0.1.3 INV-J-5 violated: expected font_extension_failed "
+            f"degradation; got kinds={kinds}"
+        )
+        # Severity contract: error.
+        ext_degs = [
+            d for d in result.fidelity_report.degradations if d.kind == "font_extension_failed"
+        ]
+        assert all(d.severity == "error" for d in ext_degs), (
+            "font_extension_failed must have severity=error per design doc \u00a73"
+        )
 
     def test_unencodable_no_output_file(self, tmp_path: Path) -> None:
         """Failed encoding should not create an output PDF."""
@@ -326,19 +414,30 @@ class TestBatchReplace:
 class TestErrorHandling:
     """Test error conditions raise appropriate exceptions."""
 
-    def test_encrypted_pdf_raises(self, tmp_path: Path) -> None:
-        """Encrypted PDF should raise PDFEditError."""
-        # Create an encrypted PDF
+    def test_encrypted_pdf_without_password_raises(self, tmp_path: Path) -> None:
+        """An encrypted PDF opened with no password raises PDFEditError.
+
+        A2.3 (INV-W-5) makes encrypted PDFs editable WHEN the caller supplies
+        the password (round-trip pinned in
+        tests/invariants/test_w_5_encryption_round_trip.py). With a NON-empty
+        user password and NO password passed, ``open_pdf`` must still translate
+        pikepdf's ``PasswordError`` into a clean ``PDFEditError`` — the v0.1.x
+        ``is_encrypted`` blanket refusal was removed by A2.3, so the honest
+        rejection now flows from the password-protected open, not a hardcoded
+        guard.
+        """
+        # Encrypt with a NON-empty user password so a no-password open fails.
         enc_path = str(tmp_path / "encrypted.pdf")
         pdf = pikepdf.Pdf.new()
         pdf.add_blank_page(page_size=(612, 792))
-        pdf.save(enc_path, encryption=pikepdf.Encryption(owner="secret", user=""))
+        pdf.save(enc_path, encryption=pikepdf.Encryption(owner="owner-pw", user="user-pw"))
         pdf.close()
 
-        # Fabricate a minimal TextMatch (won't be used — error raised early)
+        # Fabricate a minimal TextMatch (won't be used — the encrypted open
+        # raises before any match is consumed).
         dummy_match = _first_match(SIMPLE_PDF, "Test")
 
-        with pytest.raises(PDFEditError, match="encrypted"):
+        with pytest.raises(PDFEditError, match="(?i)password|protected|encrypt"):
             replace(enc_path, dummy_match, "New", str(tmp_path / "out.pdf"))
 
     def test_stale_operator_index_raises(self, tmp_path: Path) -> None:
@@ -796,3 +895,142 @@ class TestModuleCacheOwnership:
         assert "Acme Co." in text, text
         assert "Nova Industries" not in text
         assert "Acme Corporation" not in text
+
+
+# ── Phase 2 (v0.1.3) kerning deadzone boundary tests ────────────────────
+
+
+class TestKerningDecisionDeadzone:
+    """Boundary tests for ``surgeon._kerning_decision`` (Algo A, design doc §1).
+
+    Symmetric 95-105 deadzone for Degradation emission. ±0.05 deadzone
+    around 100 for Tz operator emission. Both deadzones are deterministic
+    boundaries — these tests pin them exactly.
+    """
+
+    def test_factor_exactly_100_emits_no_tz_no_degradation(self) -> None:
+        """factor == 100.0 → no Tz operator, no Degradation."""
+        tz, deg = _kerning_decision(100.0)
+        assert tz is None
+        assert deg is None
+
+    def test_factor_exactly_95_no_degradation(self) -> None:
+        """Edge of compression deadzone: factor == 95.0 → Tz emitted, no Degradation."""
+        tz, deg = _kerning_decision(95.0)
+        assert tz == 95.0
+        assert deg is None
+
+    def test_factor_94_9_emits_kerning_compressed(self) -> None:
+        """Just below compression deadzone: factor == 94.9 → kerning_compressed warning."""
+        tz, deg = _kerning_decision(94.9)
+        assert tz == 94.9
+        assert deg is not None
+        assert deg.kind == "kerning_compressed"
+        assert deg.severity == "warning"
+        assert "95" in deg.detail or "Tz" in deg.detail
+
+    def test_factor_exactly_105_no_degradation(self) -> None:
+        """Edge of widening deadzone: factor == 105.0 → Tz emitted, no Degradation."""
+        tz, deg = _kerning_decision(105.0)
+        assert tz == 105.0
+        assert deg is None
+
+    def test_factor_105_1_emits_kerning_widened(self) -> None:
+        """Just above widening deadzone: factor == 105.1 → kerning_widened info."""
+        tz, deg = _kerning_decision(105.1)
+        assert tz == 105.1
+        assert deg is not None
+        assert deg.kind == "kerning_widened"
+        assert deg.severity == "info"
+
+    def test_factor_within_tz_deadzone_no_tz_emit(self) -> None:
+        """factor within ±0.05 of 100 → no Tz operator emitted (clean op stack)."""
+        for factor in (99.96, 100.0, 100.04):
+            tz, deg = _kerning_decision(factor)
+            assert tz is None, f"factor={factor} should be in Tz deadzone"
+            # All within [95, 105] → no degradation either
+            assert deg is None
+
+    def test_factor_just_outside_tz_deadzone_emits_tz(self) -> None:
+        """factor outside ±0.05 of 100 (but within 95-105) → Tz emitted, no Degradation."""
+        for factor in (99.94, 100.06, 99.0, 101.0):
+            tz, deg = _kerning_decision(factor)
+            assert tz == factor, f"factor={factor} should emit Tz"
+            assert deg is None, f"factor={factor} in 95-105 should not degrade"
+
+    def test_factor_extreme_compression_no_refusal(self) -> None:
+        """No refusal threshold (design doc §1) — extreme factors still produce Tz + Degradation."""
+        tz, deg = _kerning_decision(50.0)
+        assert tz == 50.0
+        assert deg is not None
+        assert deg.kind == "kerning_compressed"
+
+    def test_factor_extreme_widening_no_refusal(self) -> None:
+        """Symmetric to extreme compression — extreme widening also produces Tz."""
+        tz, deg = _kerning_decision(150.0)
+        assert tz == 150.0
+        assert deg is not None
+        assert deg.kind == "kerning_widened"
+
+
+# ── Phase 13.5: M10 SOW e2e (the launch gate) ────────────────────────────
+
+
+_need_m10_sow = pytest.mark.skipif(
+    not Path(_M10_SOW).exists(),
+    reason=f"M10 SOW not present at {_M10_SOW} (set M10_SOW_PDF to override)",
+)
+
+
+@_need_m10_sow
+def test_simple_font_extension_via_m10_sow(tmp_path: Path) -> None:
+    """Sarah Chen → Søren Müller on the M10 SOW (the actual launch gate).
+
+    The M10 SOW's title block uses a /TrueType + /WinAnsiEncoding +
+    /FontFile2 font (BCDEEE+Calibri-Bold). Pre-Phase-13, the
+    ``is_cid_font`` gate at structural.py:864-865 short-circuited this
+    case to ``return False`` and replace() emitted a
+    font_extension_failed Degradation.
+
+    Phase 13 wires in the non-CID Tier 1.5 path. This e2e is the
+    contract-level proof that the launch gate now passes:
+
+    - replace() returns success=True
+    - font_action == "extended"
+    - glyphs_missing == {ø, ü}  (the two accented glyphs in
+      "Søren Müller" not in F1's embedded subset)
+    - degradations contain font_coverage_substituted (severity=warning)
+      since the outline source is a system font (Calibri-Bold or a
+      metric-equivalent like Carlito-Bold)
+    - degradations do NOT contain font_extension_failed
+    - get_text(out) contains the new string
+
+    Phase 13.4.2 verification (per Defect 5 in
+    experiments/v013_block_3_execution/prompt-defects.md): the assertion
+    ``"font_coverage_substituted" in kinds`` IS present below — Phase
+    13.4.2 is satisfied by this assertion's existence, not by a separate
+    addition.
+    """
+    match = _first_match(_M10_SOW, "Sarah Chen")
+    out = str(tmp_path / "sow_edited.pdf")
+
+    result = replace(_M10_SOW, match, "Søren Müller", out, reflow=False)
+
+    assert result.success is True, (
+        f"M10 SOW launch gate failed: {result.fidelity_report.degradations}"
+    )
+    assert result.font_action == "extended"
+    assert set(result.fidelity_report.glyphs_missing) == {"ø", "ü"}
+    kinds = [d.kind for d in result.fidelity_report.degradations]
+    assert "font_coverage_substituted" in kinds, (
+        f"expected font_coverage_substituted in degradations; got {kinds}"
+    )
+    assert "font_extension_failed" not in kinds, (
+        f"font_extension_failed must not be present; got {kinds}"
+    )
+
+    # Rendering verification — output text must contain the new string.
+    out_text = get_text(out)
+    assert "Søren Müller" in out_text, (
+        f"output PDF text does not contain 'Søren Müller'; first 200 chars: {out_text[:200]!r}"
+    )

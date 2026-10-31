@@ -8,8 +8,9 @@ from pathlib import Path
 import pikepdf
 import pytest
 
+from pdf_edit_engine import structural as _structural
 from pdf_edit_engine.locator import get_text
-from pdf_edit_engine.models import EditResult
+from pdf_edit_engine.models import Degradation, EditResult
 from pdf_edit_engine.reflow import detect_paragraphs
 from pdf_edit_engine.structural import (
     batch_replace_block,
@@ -500,6 +501,119 @@ class TestInsertTextBlock:
         assert "Section two" in text
 
 
+# ── TestInsertTextBlockHonesty (CRIT-1) ──────────────────────────────
+
+
+@_need_resume
+class TestInsertTextBlockHonesty:
+    """CRIT-1: insert_text_block must surface Tier 1.5 metric-equivalent
+    substitution in its FidelityReport (was previously hardcoding
+    font_substituted=None / degradations=[] / font_action="kept" even
+    when extension actually ran from a metric-equivalent system font).
+
+    Single-source-of-truth char selection (probed via analyze_subset on
+    tests/corpus/Aryan_BV_Resume_2026.pdf during plan development):
+    every embedded font on page 0 (F1/F2 Calibri-Bold 6954 glyphs,
+    F3/F4 Calibri 6954 glyphs, F6 ArialMT 4503 glyphs) lacks 0x00F8
+    (ø). ø is the shared test char used by both this test and
+    tests/test_fonts.py's IMP-1 cache test.
+    """
+
+    def test_metric_equivalent_surfaces_substitution(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Forces Tier 1.5 metric-equivalent path deterministically.
+
+        Without monkeypatch the test would silently no-op on any dev's
+        machine that has Calibri installed (Windows + Office is the
+        common case). The whole point of this fix is to catch silent
+        lying — a soft assertion gated on the dev's local font
+        landscape would defeat the test.
+
+        Tests the surfacing layer (the FidelityReport contract). Does
+        not assert visual fidelity of the injected glyphs; the source
+        path can be any locally-installed Calibri-Bold-or-equivalent.
+        """
+        from pdf_edit_engine import system_fonts
+
+        # Find any locally-installed Calibri-Bold-or-equivalent for use
+        # as the injection source (must be TrueType, upem=2048 to match
+        # the embedded font). The substituted_name we report is
+        # independent of which actual font we inject from — the test
+        # verifies surfacing, not visual output.
+        real = system_fonts._find_font_with_origin("Calibri-Bold")
+        if real is None:
+            pytest.skip(
+                "No Calibri-Bold or metric-equivalent installed; cannot exercise Tier 1.5 path"
+            )
+        real_path = real[0]
+
+        monkeypatch.setattr(
+            "pdf_edit_engine.system_fonts._find_font_with_origin",
+            # (path, origin, substituted_name) — F-D-CC9 v0.1.3 shape.
+            lambda ps_name: (real_path, "metric_equivalent", "Carlito-Regular"),
+        )
+
+        out = str(tmp_path / "out.pdf")
+        result = insert_text_block(
+            RESUME_PDF,
+            0,
+            x=72.0,
+            y=400.0,
+            text="ø-test",
+            output_path=out,
+            font_size=11.0,
+        )
+
+        assert result.success
+        assert result.font_action == "extended"
+        fr = result.fidelity_report
+        assert fr.font_substituted == "Carlito-Regular"
+        assert fr.font_preserved is False
+        assert any(d.kind == "font_coverage_substituted" for d in fr.degradations)
+        assert "ø" in fr.glyphs_missing
+
+        # Lock CRIT-2 contract simultaneously (font_preserved must
+        # surface via to_dict() too):
+        d = fr.to_dict()
+        assert d["font_preserved"] is False
+        assert d["font_substituted"] == "Carlito-Regular"
+        assert Path(out).exists()
+
+    def test_extension_failure_emits_typed_degradation(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """CRIT-1 expansion: failure branch (was lacking fidelity_report
+        entirely; default-factory FidelityReport reported
+        font_preserved=True even on extension failure)."""
+        from pdf_edit_engine import fonts as fonts_mod
+        from pdf_edit_engine.errors import FontNotFoundError
+
+        def _explode(*args: object, **kwargs: object) -> None:
+            raise FontNotFoundError("simulated: no system font for fixture")
+
+        monkeypatch.setattr(fonts_mod, "extend_subset", _explode)
+
+        out = str(tmp_path / "out.pdf")
+        result = insert_text_block(
+            RESUME_PDF,
+            0,
+            x=72.0,
+            y=400.0,
+            text="ø-failure",
+            output_path=out,
+            font_size=11.0,
+        )
+
+        assert result.success is False
+        assert result.font_action == "failed"
+        fr = result.fidelity_report
+        assert fr.font_preserved is False
+        assert any(
+            d.kind == "font_extension_failed" and d.severity == "error" for d in fr.degradations
+        )
+
+
 # ── TestDeleteBlock ──────────────────────────────────────────────────
 
 
@@ -552,6 +666,71 @@ class TestDeleteBlock:
         result = delete_block(SIMPLE_PDF, 0, (72.0, 667.2, 494.4, 708.2), out)
         assert result.original_text
         assert "simple test document" in result.original_text
+
+    def test_overflow_path_no_false_positive(self, tmp_path: Path) -> None:
+        """M-8 negative-case guard: delete_block's overflow branch is
+        currently unreachable from the production caller (the helper's
+        "below page boundary" warning fires only for positive delta_y,
+        but delete_block always passes delta_y = -deleted_height).
+        A normal delete must NOT spuriously emit overflow_shift_*
+        Degradations or flip overflow_detected.
+        """
+        out = str(tmp_path / "out.pdf")
+        result = delete_block(SIMPLE_PDF, 0, (72.0, 667.2, 494.4, 708.2), out)
+        assert result.success is True
+        assert result.fidelity_report.overflow_detected is False
+        assert not any(
+            d.kind.startswith("overflow_shift_") for d in result.fidelity_report.degradations
+        )
+
+    def test_overflow_path_emits_typed_degradation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """M-8 positive-case: when ``_shift_content_below_inplace`` does
+        return a "below page boundary" warning (the contract that
+        ``delete_block`` checks for), the typed Degradation emission at
+        ``structural.py:1948-1956`` MUST fire — kind=overflow_shift_clamped,
+        severity=warning, and ``overflow_detected=True`` on the report.
+
+        The production code path is currently unreachable from
+        ``delete_block`` (delta_y is always negative there) but the
+        emission is wired defensively. This monkeypatch test exercises
+        the contract directly so the wiring is regression-guarded.
+        """
+        from pikepdf import Page, Pdf
+
+        original_shift = _structural._shift_content_below_inplace
+
+        def _forced_overflow_shift(
+            pdf: Pdf,
+            page_obj: Page,
+            page_num: int,
+            y_threshold: float,
+            delta_y: float,
+        ) -> list[str]:
+            # Run the real shift so the PDF stays well-formed, then
+            # append the warning string the production code keys on.
+            warnings = original_shift(pdf, page_obj, page_num, y_threshold, delta_y)
+            warnings.append("element extends below page boundary (y=-5.0)")
+            return warnings
+
+        monkeypatch.setattr(_structural, "_shift_content_below_inplace", _forced_overflow_shift)
+
+        out = str(tmp_path / "out_overflow.pdf")
+        result = delete_block(SIMPLE_PDF, 0, (72.0, 667.2, 494.4, 708.2), out)
+
+        assert result.success is True
+        assert result.fidelity_report.overflow_detected is True
+        overflow_degs = [
+            d for d in result.fidelity_report.degradations if d.kind == "overflow_shift_clamped"
+        ]
+        assert overflow_degs, (
+            "expected overflow_shift_clamped Degradation; got "
+            f"{result.fidelity_report.degradations!r}"
+        )
+        assert isinstance(overflow_degs[0], Degradation)
+        assert overflow_degs[0].severity == "warning"
+        assert "vertical" in overflow_degs[0].detail
 
 
 @_need_resume

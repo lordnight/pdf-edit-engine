@@ -5,9 +5,9 @@ out in PAGE space (y grows up from the MediaBox bottom) and written through a
 chosen CTM + text-matrix orientation, so one layout and one set of assertions
 cover an identity page, a Y-flipped page (``cm 1 0 0 -1 0 h``) carrying a
 negative-d, unit or positive-d ``Tm``, a font-size-in-Tm run (``Tf 1`` +
-``Tm [12 0 0 12 ...]``) and a scaled CTM. Every orientation draws 12pt text on
-the page. pdfminer is the layout oracle: it places glyphs independently of the
-engine.
+``Tm [12 0 0 12 ...]``), a scaled CTM and Chrome's scaled Y-flip. Every
+orientation draws 12pt text on the page. pdfminer is the layout oracle: it
+places glyphs independently of the engine.
 """
 
 from __future__ import annotations
@@ -30,6 +30,7 @@ _Matrix = tuple[float, float, float, float, float, float]
 IDENTITY_CTM: _Matrix = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
 FLIP_CTM: _Matrix = (1.0, 0.0, 0.0, -1.0, 0.0, PAGE_HEIGHT)
 HALF_SCALE_CTM: _Matrix = (0.5, 0.0, 0.0, 0.5, 0.0, 0.0)
+CHROME_CTM: _Matrix = (0.75, 0.0, 0.0, -0.75, 0.0, PAGE_HEIGHT)
 
 
 def _num(value: float) -> str:
@@ -82,6 +83,10 @@ FLIP_POSITIVE_D_TM = Orientation(
 FLIP_IDENTITY_TM = Orientation("flip_identity_tm", FLIP_CTM, 12.0, None, upright=False)
 TM_SCALED = Orientation("tm_scaled", IDENTITY_CTM, 1.0, (12.0, 0.0, 0.0, 12.0), upright=True)
 SCALED_CTM = Orientation("scaled_ctm", HALF_SCALE_CTM, 24.0, None, upright=True)
+# Chrome/Skia: a scaled Y-flip CTM, Tf 16 drawn at 12pt, Tm [1 0 0 -1 ...].
+CHROME_SCALED_FLIP = Orientation(
+    "chrome_scaled_flip", CHROME_CTM, 16.0, (1.0, 0.0, 0.0, -1.0), upright=True
+)
 
 
 def build_page_pdf(

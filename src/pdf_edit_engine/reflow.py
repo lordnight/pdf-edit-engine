@@ -326,7 +326,8 @@ def _group_elements_into_lines(
 
     Args:
         elements: Text elements sorted by reading order (y desc, x asc).
-        font_size: Font size for threshold calculation.
+        font_size: Page-space font size (the em across the baseline, see
+            ``_page_font_size``) for threshold calculation.
 
     Returns:
         List of lines, each a list of elements. Lines sorted top-to-bottom,
@@ -370,6 +371,19 @@ def _page_scales(element: ContentElement) -> tuple[float, float]:
     return (math.hypot(a, b), math.hypot(c, d))
 
 
+def _page_font_size(element: ContentElement) -> tuple[float, float]:
+    """Page-space em of a run's first glyph: ``(along the baseline, across it)``.
+
+    The Tf size is text space; a font-size-in-Tm (``Tf 1`` +
+    ``Tm [12 0 0 12 ...]``) or scaled-CTM run draws it at a different size
+    on the page, where the positions it is compared with live.
+    """
+    chars = element.characters
+    font_size = chars[0].font_size if chars else 0.0
+    x_scale, y_scale = _page_scales(element)
+    return (font_size * x_scale, font_size * y_scale)
+
+
 def _page_right_edge(element: ContentElement) -> float:
     """Page-space right edge of a text element's glyphs.
 
@@ -400,8 +414,9 @@ def _build_paragraph(
     assert chars0 is not None
     font_size = chars0[0].font_size
     font_name = chars0[0].font_name
+    page_x_em, page_y_em = _page_font_size(elements[0])
 
-    lines = _group_elements_into_lines(elements, font_size)
+    lines = _group_elements_into_lines(elements, page_y_em)
 
     # Left margin: mode of line-start x-positions
     x_starts = [
@@ -417,7 +432,7 @@ def _build_paragraph(
     # for line 0 — store the true line-0 x so first_line_y/margin anchors the
     # actual line-0 origin. For first_line/flush the mode IS the continuation
     # margin, so keep it.
-    indent_style, first_line_indent, hanging_indent = _detect_indent_style(x_starts, font_size)
+    indent_style, first_line_indent, hanging_indent = _detect_indent_style(x_starts, page_x_em)
     if indent_style == "hanging":
         left_margin = x_starts[0]
 
@@ -512,7 +527,7 @@ def _build_paragraph(
     # width) keeps word-boundary gaps above threshold (real spaces
     # in content streams render as ≥ space-width gaps between
     # elements) while keeping punctuation-adjacency gaps below it.
-    space_width = font_size * 0.125
+    space_width = page_x_em * 0.125
     line_texts: list[str] = []
     for line in lines:
         text_parts: list[str] = []
@@ -524,7 +539,7 @@ def _build_paragraph(
             if prev_end_x is not None and (curr_start_x - prev_end_x) > space_width:
                 text_parts.append(" ")
             text_parts.append(e.text_content)
-            prev_end_x = e.characters[-1].page_x + e.characters[-1].width
+            prev_end_x = e.characters[-1].page_x + e.characters[-1].width * _page_scales(e)[0]
         line_texts.append("".join(text_parts))
     full_text = "\n".join(line_texts)
 
@@ -641,10 +656,12 @@ def _detect_paragraphs_from_index(
         curr_chars = elem.characters
         assert prev_chars is not None and curr_chars is not None
 
+        # Sizes and the thresholds they scale are page space, like the
+        # positions they are compared with.
         prev_font = prev_chars[0].font_name
-        prev_size = prev_chars[0].font_size
+        prev_size = _page_font_size(prev)[1]
         curr_font = curr_chars[0].font_name
-        curr_size = curr_chars[0].font_size
+        curr_size = _page_font_size(elem)[1]
         prev_y = prev_chars[0].page_y
         curr_y = curr_chars[0].page_y
         curr_x = curr_chars[0].page_x
@@ -1970,11 +1987,12 @@ def reflow_paragraph(
     # not flip ``font_preserved``.
     indent_degradations: list[Degradation] = []
     if paragraph.indent_style == "flush":
+        page_x_em, page_y_em = _page_font_size(paragraph.elements[0])
         _src_x_starts = [
             ln[0].characters[0].page_x  # type: ignore[index]
-            for ln in _group_elements_into_lines(paragraph.elements, paragraph.font_size)
+            for ln in _group_elements_into_lines(paragraph.elements, page_y_em)
         ]
-        if _is_degraded_flush(_src_x_starts, paragraph.font_size):
+        if _is_degraded_flush(_src_x_starts, page_x_em):
             indent_degradations.append(
                 Degradation(
                     kind="indent_flattened",

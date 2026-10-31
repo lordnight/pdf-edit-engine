@@ -29,6 +29,7 @@ from pdfminer.layout import LTCurve, LTImage
 
 from pdf_edit_engine import add_watermark, find, replace, replace_block, shift_content_below
 from tests._flipped_page_fixture import (
+    CHROME_SCALED_FLIP,
     FLIP_IDENTITY_TM,
     FLIP_NEGATIVE_D_TM,
     FLIP_POSITIVE_D_TM,
@@ -67,6 +68,7 @@ ORIENTATIONS = [
     FLIP_IDENTITY_TM,
     TM_SCALED,
     SCALED_CTM,
+    CHROME_SCALED_FLIP,
 ]
 
 
@@ -100,11 +102,15 @@ def _page(
     )
 
 
+@pytest.mark.parametrize("footer_y", [670.0, 700.0], ids=["72pt_below", "42pt_below"])
 @pytest.mark.parametrize("orientation", ORIENTATIONS, ids=lambda o: o.name)
 def test_footer_moves_down_by_the_added_lines_and_clears_the_paragraph(
-    orientation: Orientation, tmp_path: Path
+    orientation: Orientation, footer_y: float, tmp_path: Path
 ) -> None:
-    src = _page(orientation, tmp_path, footer_y=670)
+    # 42pt is a separate block on a 12pt page (the paragraph break is 2.5 em
+    # of PAGE-space font size); measured in Tf units a 24pt-Tf run under a
+    # 0.5 CTM swallowed it into the paragraph.
+    src = _page(orientation, tmp_path, footer_y=footer_y)
     before = _footer(page_lines(src))
     out = tmp_path / "out.pdf"
 

@@ -8,7 +8,9 @@ line's position) instead of flattening it to an identity ``Tm`` or refusing it
 as rotated (the v0.2.0 B.12 gate refused every non-identity ``Tm``), under any
 axis-aligned CTM: flipped, scaled or identity. Text whose baseline is rotated,
 sheared or reversed on the page, through the ``Tm`` or the CTM, is still
-refused with ``rotated_text_unsupported`` (INV-B-8).
+refused with ``rotated_text_unsupported`` (INV-B-8). Paragraph detection groups
+lines, breaks paragraphs and joins runs by the page-space font size, so such a
+page is read into the same paragraphs as the identity page it renders like.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ import pytest
 from pdf_edit_engine import find, replace
 from pdf_edit_engine.reflow import _low_confidence_diagnostics, detect_paragraphs
 from tests._flipped_page_fixture import (
+    CHROME_SCALED_FLIP,
     FLIP_CTM,
     FLIP_IDENTITY_TM,
     FLIP_NEGATIVE_D_TM,
@@ -38,6 +41,7 @@ from tests._flipped_page_fixture import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
     from pdf_edit_engine.models import EditResult
@@ -63,6 +67,7 @@ def _reflow(src: Path, out: Path) -> EditResult:
         FLIP_POSITIVE_D_TM,
         FLIP_IDENTITY_TM,
         SCALED_CTM,
+        CHROME_SCALED_FLIP,
     ],
     ids=lambda o: o.name,
 )
@@ -127,6 +132,54 @@ def test_paragraph_metrics_are_page_space_whatever_the_orientation(
     assert _low_confidence_diagnostics(paragraph, PAGE_WIDTH) == pytest.approx(
         _low_confidence_diagnostics(expected, PAGE_WIDTH)
     ), "the S5 table-cluster signal must read the same page-space widths"
+
+
+_PAGE_SPACE_ORIENTATIONS = [FLIP_NEGATIVE_D_TM, TM_SCALED, SCALED_CTM, CHROME_SCALED_FLIP]
+
+
+def _blocks_page(orientation: Orientation) -> bytes:
+    """A header, a two-line paragraph and a footer, 36pt / 14.4pt / 36pt apart.
+
+    36pt is three 12pt lines: a paragraph break on the page (2.5 em) but not
+    in the units of a Tf 16 run under Chrome's 0.75 CTM (2.5 x 16 = 40).
+    """
+    second_baseline = _FIRST_BASELINE - 14.4
+    return (
+        orientation.prologue()
+        + orientation.run(72, _FIRST_BASELINE + 36, "Header line")
+        + orientation.run(72, _FIRST_BASELINE, "Total: 100 units as noted")
+        + orientation.run(72, second_baseline, "in the signed order")
+        + orientation.run(72, second_baseline - 36, "Footer line stays")
+    )
+
+
+def _jittered_line(orientation: Orientation) -> bytes:
+    """One visual line drawn as two runs whose baselines differ by 1pt."""
+    return (
+        orientation.prologue()
+        + orientation.run(72, _FIRST_BASELINE, "Total:")
+        + orientation.run(72 + 7 * 0.6 * PAGE_FONT_SIZE, _FIRST_BASELINE + 1, "100 units")
+    )
+
+
+def _split_run_line(orientation: Orientation) -> bytes:
+    """One word split across two show operators in one text object."""
+    return orientation.prologue() + orientation.run(72, _FIRST_BASELINE, "Tot").replace(
+        b"(Tot) Tj", b"(Tot) Tj (al: 100 units) Tj"
+    )
+
+
+@pytest.mark.parametrize("build", [_blocks_page, _jittered_line, _split_run_line])
+@pytest.mark.parametrize("orientation", _PAGE_SPACE_ORIENTATIONS, ids=lambda o: o.name)
+def test_paragraph_detection_matches_an_identity_page(
+    orientation: Orientation, build: Callable[[Orientation], bytes], tmp_path: Path
+) -> None:
+    expected = detect_paragraphs(str(build_page_pdf(tmp_path / "identity.pdf", build(IDENTITY))))
+    detected = detect_paragraphs(str(build_page_pdf(tmp_path / "in.pdf", build(orientation))))
+
+    assert [(p.full_text, p.line_count) for p in detected] == [
+        (p.full_text, p.line_count) for p in expected
+    ], "line grouping, paragraph breaks and word joins must use the page-space font size"
 
 
 _COS5 = math.cos(math.radians(5))

@@ -366,7 +366,7 @@ class ContentStreamInterpreter:
                         unicode_char=ch,
                         page_x=pos[0],
                         page_y=pos[1],
-                        width=sub_width * font_size,
+                        width=sub_width * font_size * self._tracker.horizontal_scaling,
                         height=font_size,
                         font_name=font_name,
                         font_size=font_size,

@@ -320,6 +320,11 @@ class GraphicsStateTracker:
         return self._font_size
 
     @property
+    def horizontal_scaling(self) -> float:
+        """Current horizontal scaling (``Tz`` / 100)."""
+        return self._horiz_scaling
+
+    @property
     def fill_color(self) -> tuple[float, ...] | None:
         """Current fill color, or None if not set."""
         return self._fill_color

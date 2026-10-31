@@ -964,12 +964,48 @@ def _encode_with_kerning(
     )
 
 
+@dataclass(frozen=True)
+class ReplacementScaling:
+    """Tz factor for a rebuilt show operator and the TJ items it applies to.
+
+    ``span`` is the ``[start, end)`` range of the operator's TJ array that
+    holds the replacement items; the items outside it are the operator's
+    untouched text and keep their width.
+    """
+
+    tz_factor: float
+    span: tuple[int, int]
+
+
+def _scale_replacement_items(inst: Any, scaling: ReplacementScaling) -> _Ops:
+    """Split a rebuilt TJ operator so only its replacement items are Tz-scaled.
+
+    Returns the instructions that replace *inst*: the items before the span
+    as a TJ, ``Tz <factor>``, the span as a TJ, ``Tz 100``, and the items
+    after the span as a TJ. Empty pieces are left out.
+    """
+    operands = inst.operands if hasattr(inst, "operands") else inst[0]
+    items = list(operands[0])
+    start, end = scaling.span
+    tj_op = pikepdf.Operator("TJ")
+    tz_op = pikepdf.Operator("Tz")
+    split: _Ops = []
+    if items[:start]:
+        split.append(([pikepdf.Array(items[:start])], tj_op))
+    split.append(([round(scaling.tz_factor, 3)], tz_op))
+    split.append(([pikepdf.Array(items[start:end])], tj_op))
+    split.append(([100], tz_op))
+    if items[end:]:
+        split.append(([pikepdf.Array(items[end:])], tj_op))
+    return split
+
+
 def _rebuild_tj_array(
     tj_items: list[object],
     match_chars: list[TextCharacter],
     replacement_items: list[object],
     byte_width: int = 0,
-) -> pikepdf.Array:
+) -> tuple[pikepdf.Array, tuple[int, int] | None]:
     """Rebuild a TJ array replacing the matched span with new items.
 
     Fragments before the match are preserved. The matched span is replaced
@@ -996,11 +1032,13 @@ def _rebuild_tj_array(
             keeps the heuristic byte-for-byte by leaving ``byte_width`` 0.
 
     Returns:
-        New pikepdf.Array for the TJ operand.
+        New pikepdf.Array for the TJ operand, and the ``[start, end)`` item
+        span the replacement items occupy in it (``None`` when the match has
+        no fragment in this array and nothing was replaced).
     """
     frag_indices = {ch.tj_fragment_index for ch in match_chars if ch.tj_fragment_index is not None}
     if not frag_indices:
-        return pikepdf.Array(tj_items)
+        return pikepdf.Array(tj_items), None
 
     min_frag = min(frag_indices)
     max_frag = max(frag_indices)
@@ -1049,8 +1087,10 @@ def _rebuild_tj_array(
         new_items.append(pikepdf.String(prefix_bytes))
 
     # Add the replacement items (strings + optional kerning values)
+    replacement_start = len(new_items)
     for item in replacement_items:
         new_items.append(item)
+    replacement_span = (replacement_start, len(new_items))
 
     # Add suffix if present
     if suffix_bytes:
@@ -1060,7 +1100,7 @@ def _rebuild_tj_array(
     for item in tj_items[max_arr_idx + 1 :]:
         new_items.append(item)
 
-    return pikepdf.Array(new_items)
+    return pikepdf.Array(new_items), replacement_span
 
 
 def _infer_byte_width(raw: bytes, chars: list[TextCharacter]) -> int:
@@ -1537,7 +1577,7 @@ def _apply_single_replacement(
     # dry_run=True must produce the same Degradation list as dry_run=False
     # for the same input. Ops mutation is invisible in dry_run (the save
     # is skipped further up the call chain).
-    op_tz_factors: dict[int, float] = {}
+    op_scalings: dict[int, ReplacementScaling] = {}
     kerning_degradations: list[Degradation] = []
     # B.9 (INV-B-9): collect every source substring that encode() collapsed
     # into a ligature CID (mandatory always, opted-in discretionary). The
@@ -1572,7 +1612,7 @@ def _apply_single_replacement(
             if wb == 0.0:
                 wb = merged_width_bonus[op_idx]
 
-        op_tz: float | None = None
+        op_tz: ReplacementScaling | None = None
         op_deg: Degradation | None = None
         if op_str in ("TJ",):
             op_tz, op_deg = _modify_tj_operator(
@@ -1608,20 +1648,18 @@ def _apply_single_replacement(
             )
 
         if op_tz is not None:
-            op_tz_factors[op_idx] = op_tz
+            op_scalings[op_idx] = op_tz
         if op_deg is not None:
             kerning_degradations.append(op_deg)
 
-    # Tz post-pass: wrap each affected op_idx with `Tz <factor>` ... `Tz 100`.
-    # Iterate in REVERSE op_idx order so the .insert() calls don't shift
-    # indices we still have to process. Only mutate when not dry_run; the
-    # degradations themselves were already collected above.
-    if not dry_run and op_tz_factors:
-        tz_op = pikepdf.Operator("Tz")
-        for op_idx in sorted(op_tz_factors.keys(), reverse=True):
-            tz_factor = op_tz_factors[op_idx]
-            ops.insert(op_idx + 1, ([100], tz_op))
-            ops.insert(op_idx, ([round(tz_factor, 3)], tz_op))
+    # Tz post-pass: bracket each affected op's replacement items with
+    # `Tz <factor>` ... `Tz 100`, leaving the text before and after them in
+    # the operator unscaled. Iterate in REVERSE op_idx order so the splits
+    # don't shift indices we still have to process. Only mutate when not
+    # dry_run; the degradations themselves were already collected above.
+    if not dry_run and op_scalings:
+        for op_idx in sorted(op_scalings.keys(), reverse=True):
+            ops[op_idx : op_idx + 1] = _scale_replacement_items(ops[op_idx], op_scalings[op_idx])
 
     # Calculate widths
     old_width = sum(ch.width for ch in match.characters)
@@ -1812,14 +1850,15 @@ def _modify_tj_operator(
     font_size: float | None = None,
     width_bonus: float = 0.0,
     observed: list[str] | None = None,
-) -> tuple[float | None, Degradation | None]:
+) -> tuple[ReplacementScaling | None, Degradation | None]:
     """Modify a TJ operator's array to apply replacement text.
 
-    Returns ``(tz_factor, degradation)`` for the caller to wrap the
-    operator with PDF ``Tz`` operators (in a separate post-pass to keep
-    operator-index stability across multiple edits) and to plumb the
-    Degradation up through the FidelityReport. Both fields are ``None``
-    when no kerning/scaling was applied (e.g., same-length path).
+    Returns ``(scaling, degradation)``: the Tz factor and the TJ items the
+    replacement occupies, for the caller to bracket with PDF ``Tz``
+    operators (in a separate post-pass to keep operator-index stability
+    across multiple edits), and the Degradation to plumb up through the
+    FidelityReport. Both are ``None`` when no kerning/scaling was applied
+    (e.g., same-length path).
     """
     inst = ops[op_idx]
     operands = inst.operands if hasattr(inst, "operands") else inst[0]
@@ -1882,9 +1921,11 @@ def _modify_tj_operator(
         # (byte_width == 1) passes 0 to keep the pre-B.11 _infer_byte_width
         # heuristic byte-for-byte.
         rebuild_bw = byte_width if byte_width == 2 else 0
-        new_array = _rebuild_tj_array(tj_items, op_chars, replacement_items, rebuild_bw)
+        new_array, span = _rebuild_tj_array(tj_items, op_chars, replacement_items, rebuild_bw)
         ops[op_idx] = ([new_array], operator)
-        return tz_factor, degradation
+        if tz_factor is None or span is None:
+            return None, degradation
+        return ReplacementScaling(tz_factor=tz_factor, span=span), degradation
 
 
 def _modify_tj_single_operator(
@@ -1901,10 +1942,10 @@ def _modify_tj_single_operator(
     font_size: float | None = None,
     width_bonus: float = 0.0,
     observed: list[str] | None = None,
-) -> tuple[float | None, Degradation | None]:
+) -> tuple[ReplacementScaling | None, Degradation | None]:
     """Modify a Tj (or ') operator's string to apply replacement text.
 
-    Returns ``(tz_factor, degradation)`` — see ``_modify_tj_operator``.
+    Returns ``(scaling, degradation)`` — see ``_modify_tj_operator``.
     """
     inst = ops[op_idx]
     operands = inst.operands if hasattr(inst, "operands") else inst[0]
@@ -1941,11 +1982,14 @@ def _modify_tj_single_operator(
             tj_items: list[object] = []
             if prefix_bytes:
                 tj_items.append(pikepdf.String(prefix_bytes))
+            span = (len(tj_items), len(tj_items) + len(enc.tj_items))
             tj_items.extend(enc.tj_items)
             if suffix_bytes:
                 tj_items.append(pikepdf.String(suffix_bytes))
             ops[op_idx] = ([pikepdf.Array(tj_items)], pikepdf.Operator("TJ"))
-            return enc.tz_factor, enc.degradation
+            if enc.tz_factor is None:
+                return None, enc.degradation
+            return ReplacementScaling(tz_factor=enc.tz_factor, span=span), enc.degradation
         else:
             min_pos = min(ch.byte_position for ch in op_chars)
             max_pos = max(ch.byte_position for ch in op_chars) + byte_width

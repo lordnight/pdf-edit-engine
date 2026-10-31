@@ -973,6 +973,162 @@ class TestKerningDecisionDeadzone:
         assert deg.kind == "kerning_widened"
 
 
+# ── Tz scope: only the replacement is scaled ────────────────────────────
+
+
+def _build_helvetica_line_pdf(out_path: Path, show_ops: bytes, font_size: int = 12) -> None:
+    """One-line page in a Helvetica /Type1 font with explicit AFM /Widths."""
+    from pdfminer.fontmetrics import FONT_METRICS
+
+    metrics = FONT_METRICS["Helvetica"][1]
+    pdf = pikepdf.new()
+    font = pikepdf.Dictionary(
+        Type=pikepdf.Name.Font,
+        Subtype=pikepdf.Name.Type1,
+        BaseFont=pikepdf.Name.Helvetica,
+        Encoding=pikepdf.Name.WinAnsiEncoding,
+        FirstChar=32,
+        LastChar=126,
+        Widths=pikepdf.Array([metrics.get(chr(code), 0) for code in range(32, 127)]),
+    )
+    page = pdf.add_blank_page(page_size=(612, 792))
+    page.Resources = pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=pdf.make_indirect(font)))
+    page.Contents = pdf.make_stream(b"BT /F1 %d Tf 72 700 Td " % font_size + show_ops + b" ET")
+    pdf.save(out_path)
+
+
+def _glyph_x0s(pdf_path: Path) -> list[tuple[str, float]]:
+    from pdfminer.high_level import extract_pages
+    from pdfminer.layout import LTChar
+
+    glyphs: list[tuple[str, float]] = []
+
+    def walk(obj: object) -> None:
+        if isinstance(obj, LTChar):
+            glyphs.append((obj.get_text(), obj.x0))
+        elif hasattr(obj, "__iter__"):
+            for child in obj:
+                walk(child)
+
+    for page in extract_pages(str(pdf_path)):
+        walk(page)
+    return glyphs
+
+
+class TestTzScalesOnlyTheReplacement:
+    """A different-length in-line replacement keeps the rest of its line in place.
+
+    The Tz factor is computed from the matched span alone, so only the
+    replacement glyphs may be drawn under it: the text before and after the
+    match in the same show operator keeps its original x positions.
+    """
+
+    @pytest.mark.parametrize(
+        ("show_ops", "font_size", "target", "replacement", "prefix", "suffix"),
+        [
+            (b"(Date: January 2024 issued) Tj", 12, "January", "May", "Date: ", " 2024 issued"),
+            (
+                b"[(Invoice date: January 15, 2024) -250 (Ref: ACME-7781)] TJ",
+                11,
+                "January",
+                "May",
+                "Invoice date: ",
+                " 15, 2024Ref: ACME-7781",
+            ),
+            (
+                b"[(Invoice date: January 15, 2024) -250 (Ref: ACME-7781)] TJ",
+                11,
+                "ACME-7781",
+                "AC-1",
+                "Invoice date: January 15, 2024Ref: ",
+                "",
+            ),
+            (
+                b"(Company: Acme Corp Ltd) Tj",
+                12,
+                "Acme Corp",
+                "Acme Corporation",
+                "Company: ",
+                " Ltd",
+            ),
+        ],
+        ids=["tj-shorter", "tj-array-shorter", "tj-array-last-fragment", "tj-longer"],
+    )
+    def test_text_around_the_match_keeps_its_x_positions(
+        self,
+        tmp_path: Path,
+        show_ops: bytes,
+        font_size: int,
+        target: str,
+        replacement: str,
+        prefix: str,
+        suffix: str,
+    ) -> None:
+        src = tmp_path / "line.pdf"
+        out = tmp_path / "edited.pdf"
+        _build_helvetica_line_pdf(src, show_ops, font_size)
+        before = _glyph_x0s(src)
+
+        result = replace(
+            str(src), _first_match(str(src), target), replacement, str(out), reflow=False
+        )
+
+        assert result.success is True, result.fidelity_report.degradations
+        after = _glyph_x0s(out)
+        assert "".join(ch for ch, _ in after) == prefix + replacement + suffix
+        moved_prefix = [
+            (ch, round(old, 2), round(new, 2))
+            for (ch, old), (_, new) in zip(before[: len(prefix)], after[: len(prefix)], strict=True)
+            if abs(old - new) > 0.01
+        ]
+        assert not moved_prefix, f"text before the match moved: {moved_prefix}"
+        moved_suffix = [
+            (ch, round(old, 2), round(new, 2))
+            for (ch, old), (_, new) in zip(
+                before[len(before) - len(suffix) :], after[len(after) - len(suffix) :], strict=True
+            )
+            if abs(old - new) > 0.01
+        ]
+        assert not moved_suffix, f"text after the match moved: {moved_suffix}"
+
+    def test_chained_edit_of_scaled_text_keeps_the_suffix_in_place(self, tmp_path: Path) -> None:
+        src = tmp_path / "line.pdf"
+        first = tmp_path / "first.pdf"
+        second = tmp_path / "second.pdf"
+        _build_helvetica_line_pdf(src, b"(Company: Acme Corp Ltd) Tj")
+        suffix_before = _glyph_x0s(src)[-4:]
+
+        replace(str(src), _first_match(str(src), "Acme Corp"), "Beta Inc", str(first))
+        result = replace(str(first), _first_match(str(first), "Beta Inc"), "Zeta", str(second))
+
+        assert result.success is True, result.fidelity_report.degradations
+        suffix_after = _glyph_x0s(second)[-4:]
+        assert [ch for ch, _ in suffix_after] == [" ", "L", "t", "d"]
+        assert all(
+            abs(old - new) < 0.01
+            for (_, old), (_, new) in zip(suffix_before, suffix_after, strict=True)
+        ), f"suffix moved from {suffix_before} to {suffix_after}"
+
+    def test_tz_pair_brackets_only_the_replacement_items(self, tmp_path: Path) -> None:
+        src = tmp_path / "line.pdf"
+        out = tmp_path / "edited.pdf"
+        _build_helvetica_line_pdf(src, b"(Date: January 2024 issued) Tj")
+
+        replace(str(src), _first_match(str(src), "January"), "May", str(out))
+
+        with pikepdf.open(out) as pdf:
+            ops = [
+                (str(operator), operands)
+                for operands, operator in pikepdf.parse_content_stream(pdf.pages[0])
+            ]
+        tz_at = [i for i, (op, _) in enumerate(ops) if op == "Tz"]
+        assert len(tz_at) == 2, ops
+        inside = ops[tz_at[0] + 1 : tz_at[1]]
+        assert [op for op, _ in inside] == ["TJ"], inside
+        assert [bytes(item) for item in inside[0][1][0]] == [b"May"]
+        assert float(ops[tz_at[1]][1][0]) == 100.0
+
+
 # ── Phase 13.5: M10 SOW e2e (the launch gate) ────────────────────────────
 
 
